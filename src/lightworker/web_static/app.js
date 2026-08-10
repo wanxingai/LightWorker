@@ -166,8 +166,10 @@ async function loadHealth() {
     byId("healthDot").classList.add("is-online");
     byId("healthLabel").textContent = health.model_configured ? "本地服务正常" : "模型配置缺失";
     byId("modelName").textContent = health.model || "未配置模型";
+    byId("composerModel").textContent = health.model || "未配置模型";
   } catch (error) {
     byId("healthLabel").textContent = "本地服务不可用";
+    byId("composerModel").textContent = "模型不可用";
     showToast(error.message, true);
   }
 }
@@ -538,9 +540,10 @@ function updateAssistantIntro(run) {
   } else if (run.job?.state === "queued") {
     message = "任务已进入本地队列，稍后开始执行。";
   } else if (isBusy(run)) {
-    message = run.current_step
-      ? `正在执行：${stepLabel(run.current_step.replace(/^approval:/, ""))}`
-      : "正在执行任务，页面会自动更新真实运行输出。";
+    const current = run.current_step
+      ? `当前正在${stepLabel(run.current_step.replace(/^approval:/, ""))}。`
+      : "任务已经开始处理。";
+    message = `${current}已开始的阶段和工具调用会按执行顺序逐行显示在下方。`;
   } else if (run.status === "succeeded") {
     message = run.unified_mode
       ? run.has_changes
@@ -580,6 +583,23 @@ function updateProcessPanel(run) {
     label = "处理未完成";
   }
   byId("processLabel").textContent = label;
+
+  const progress = byId("processProgress");
+  const showProgress = isBusy(run) || waiting;
+  progress.classList.toggle("is-hidden", !showProgress);
+  if (showProgress) {
+    const activity = (run.activity || []).filter((step) => step.status !== "skipped");
+    const toolCount = activity.reduce((total, step) => total + (step.tools?.length || 0), 0);
+    const currentIndex = Math.max(
+      activity.findIndex((step) => ["running", "waiting_approval"].includes(step.status)) + 1,
+      activity.filter((step) => step.status === "success").length,
+      1,
+    );
+    const stage = run.unified_mode
+      ? stepLabel(run.current_step?.replace(/^approval:/, "") || "agentic_loop")
+      : `第 ${Math.min(currentIndex, Math.max(activity.length, 1))}/${Math.max(activity.length, 1)} 阶段`;
+    progress.textContent = `${stage} · ${toolCount} 次工具调用`;
+  }
 
   const updateElapsed = () => {
     if (state.currentRunId !== run.run_id) return;
@@ -641,10 +661,13 @@ function renderActivity(activity, run) {
   visible.forEach((step, index) => {
     const displayStatus = activityDisplayStatus(step);
     const details = document.createElement("details");
+    const agenticStream = step.name === "agentic_loop" && Boolean(
+      step.tools?.length || step.notices?.length || step.output || step.error,
+    );
     const visualStatus = displayStatus === "verification_failed" ? "failed" :
       displayStatus === "verification_passed" ? "success" : displayStatus;
-    details.className = `activity-step status-${visualStatus}`;
-    details.open = ["running", "failed", "waiting_approval", "verification_failed"].includes(displayStatus);
+    details.className = `activity-step status-${visualStatus}${agenticStream ? " agentic-stream" : ""}`;
+    details.open = agenticStream || ["running", "failed", "waiting_approval", "verification_failed"].includes(displayStatus);
 
     const summary = document.createElement("summary");
     const title = document.createElement("span");
@@ -713,11 +736,22 @@ function renderTools(tools) {
     const details = document.createElement("details");
     details.className = "tool-event";
     const summary = document.createElement("summary");
+    const copy = document.createElement("span");
+    copy.className = "tool-event-copy";
+    const activity = toolActivity(tool);
+    const kind = document.createElement("span");
+    kind.className = "tool-kind";
+    kind.textContent = activity.kind;
     const name = document.createElement("span");
-    name.textContent = tool.name;
+    name.className = "tool-event-name";
+    name.textContent = activity.label;
+    const technicalName = document.createElement("code");
+    technicalName.textContent = tool.name;
+    copy.append(kind, name, technicalName);
     const meta = document.createElement("span");
-    meta.textContent = tool.output === null ? "等待输出" : duration(tool.latency_ms) || "完成";
-    summary.append(name, meta);
+    meta.className = "tool-event-meta";
+    meta.textContent = tool.output === null ? "运行中" : duration(tool.latency_ms) || "完成";
+    summary.append(copy, meta);
     const output = document.createElement("pre");
     const parts = [];
     if (tool.arguments) parts.push(`参数\n${tool.arguments}`);
@@ -727,6 +761,29 @@ function renderTools(tools) {
     list.append(details);
   });
   return list;
+}
+
+function toolActivity(tool) {
+  const name = String(tool?.name || "tool").toLowerCase();
+  if (name.includes("screenshot") || name.includes("image")) return { kind: "图像", label: "查看了图像" };
+  if (name.includes("browser_open") || name.includes("navigate")) return { kind: "浏览器", label: "打开了网页" };
+  if (name.includes("browser") || name.includes("http") || name.includes("search_web") || name.includes("web_search")) {
+    return { kind: "网络", label: "读取了外部资料" };
+  }
+  if (name.includes("goal")) return { kind: "目标", label: "更新了任务目标" };
+  if (name.includes("rag") || name.includes("memory")) return { kind: "知识", label: "读取了长期资料" };
+  if (name.includes("shell") || name.includes("command") || name.includes("exec")) {
+    return { kind: "命令", label: "运行了命令" };
+  }
+  if (name.includes("patch") || name.includes("write") || name.includes("edit")) {
+    return { kind: "编辑", label: "修改了文件" };
+  }
+  if (name.includes("read") || name.includes("file") || name.includes("list") || name.includes("search_text")) {
+    return { kind: "文件", label: "读取了工作区文件" };
+  }
+  if (name.includes("agent")) return { kind: "代理", label: "委托了子 Agent" };
+  if (name.includes("git") || name.includes("diff")) return { kind: "变更", label: "检查了文件变更" };
+  return { kind: "工具", label: "调用了工具" };
 }
 
 function renderVerification(results) {
@@ -918,6 +975,8 @@ function updateComposerMode(run) {
   const continuing = Boolean(state.currentRunId);
   const busy = continuing && isBusy(run);
   byId("composerOptions").classList.toggle("is-hidden", continuing);
+  byId("composerContext").classList.toggle("is-hidden", !continuing);
+  byId("composerStopButton").classList.toggle("is-hidden", !busy);
   byId("taskInput").placeholder = continuing
     ? "继续补充资料或追问，按 Enter 发送…"
     : "描述任意任务，按 Enter 提交…";
@@ -1033,6 +1092,7 @@ function bindEvents() {
   byId("rerunButton").addEventListener("click", () => runAction("rerun"));
   byId("pauseButton").addEventListener("click", () => runAction("pause"));
   byId("cancelButton").addEventListener("click", () => runAction("cancel"));
+  byId("composerStopButton").addEventListener("click", () => runAction("cancel"));
   byId("approveApprovalButton").addEventListener("click", () => decideApproval("approved"));
   byId("rejectApprovalButton").addEventListener("click", () => decideApproval("rejected"));
   byId("sidebarOpenButton").addEventListener("click", () => document.body.classList.add("sidebar-open"));

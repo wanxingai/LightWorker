@@ -122,6 +122,25 @@ def test_web_ui_collapses_completed_process_before_final_output(tmp_path: Path):
     assert 'activeProcess && step.status === "pending"' in app.text
 
 
+def test_web_ui_exposes_stream_activity_and_composer_runtime_controls(tmp_path: Path):
+    client, _ = make_client(tmp_path)
+
+    page = client.get("/")
+    app = client.get("/static/app.js")
+    styles = client.get("/static/styles.css")
+
+    assert page.status_code == 200
+    assert app.status_code == 200
+    assert styles.status_code == 200
+    for element_id in ("processProgress", "composerContext", "composerModel", "composerStopButton"):
+        assert f'id="{element_id}"' in page.text
+    assert "function toolActivity" in app.text
+    assert 'kind: "文件", label: "读取了工作区文件"' in app.text
+    assert 'composerStopButton").addEventListener' in app.text
+    assert ".activity-step.agentic-stream > summary" in styles.text
+    assert ".composer-model" in styles.text
+
+
 def test_create_run_validates_repo_and_commands(git_repo: Path, tmp_path: Path):
     CapturingRunner.specs.clear()
     manager = ImmediateManager()

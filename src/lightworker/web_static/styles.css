@@ -555,8 +555,11 @@ select:focus-visible {
 }
 
 .assistant-intro {
-  margin-bottom: 16px;
-  color: var(--muted-strong);
+  max-width: 800px;
+  margin-bottom: 20px;
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.82;
 }
 
 .process-panel {
@@ -566,12 +569,12 @@ select:focus-visible {
 
 .process-panel > .process-summary {
   width: fit-content;
-  min-height: 38px;
-  padding: 4px 1px 12px 0;
+  min-height: 43px;
+  padding: 5px 1px 14px 0;
   color: var(--muted);
   cursor: pointer;
   direction: rtl;
-  font-size: 13px;
+  font-size: 15px;
   list-style-position: outside;
 }
 
@@ -591,7 +594,7 @@ select:focus-visible {
 
 .process-summary-copy strong {
   color: var(--muted-strong);
-  font-weight: 680;
+  font-weight: 650;
 }
 
 .process-panel.is-active .process-summary-copy strong {
@@ -603,12 +606,16 @@ select:focus-visible {
 }
 
 .process-content {
-  padding: 10px 0 16px;
+  padding: 18px 0 20px;
+}
+
+.process-panel[open] > .process-content {
+  border-top: 1px solid var(--line);
 }
 
 .activity-list {
   display: grid;
-  gap: 0;
+  gap: 3px;
 }
 
 .activity-step {
@@ -624,11 +631,11 @@ select:focus-visible {
 
 .activity-step > summary {
   display: grid;
-  min-height: 34px;
+  min-height: 39px;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
-  padding: 6px 4px;
+  padding: 7px 5px;
   cursor: pointer;
   list-style: none;
   border-radius: 7px;
@@ -647,8 +654,8 @@ select:focus-visible {
   min-width: 0;
   align-items: center;
   gap: 9px;
-  font-size: 12px;
-  font-weight: 660;
+  font-size: 13px;
+  font-weight: 620;
 }
 
 .step-state {
@@ -693,6 +700,14 @@ select:focus-visible {
   border-top: 0;
 }
 
+.activity-step.agentic-stream > summary {
+  display: none;
+}
+
+.activity-step.agentic-stream > .step-details {
+  padding: 0;
+}
+
 .step-output {
   max-height: 260px;
   overflow: auto;
@@ -709,8 +724,8 @@ select:focus-visible {
 
 .tool-list {
   display: grid;
-  gap: 2px;
-  margin-top: 3px;
+  gap: 4px;
+  margin-top: 0;
 }
 
 .tool-event {
@@ -722,15 +737,14 @@ select:focus-visible {
 
 .tool-event summary {
   display: flex;
-  min-height: 30px;
+  min-height: 42px;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 5px 8px;
+  padding: 7px 4px;
   cursor: pointer;
-  color: #444741;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 10px;
+  color: var(--muted-strong);
+  font-size: 13px;
   list-style: none;
 }
 
@@ -753,6 +767,70 @@ select:focus-visible {
   font-size: 10px;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.tool-event-copy {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+
+.tool-kind {
+  flex: 0 0 auto;
+  min-width: 42px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  color: var(--muted-strong);
+  font-size: 10px;
+  font-weight: 720;
+  text-align: center;
+}
+
+.tool-event-name {
+  flex: 0 0 auto;
+  font-weight: 610;
+}
+
+.tool-event-copy code {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-event-meta {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+}
+
+.process-progress {
+  position: absolute;
+  z-index: 2;
+  top: -34px;
+  left: 50%;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0;
+  padding: 8px 13px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f4f4f1;
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  box-shadow: 0 8px 24px rgba(30, 32, 29, 0.1);
 }
 
 .notice-line {
@@ -1058,20 +1136,22 @@ select:focus-visible {
 }
 
 .composer-wrap {
+  position: relative;
   z-index: 9;
-  padding: 12px 24px 15px;
-  background: linear-gradient(to top, white 76%, rgba(255, 255, 255, 0));
+  padding: 10px 24px 17px;
+  background: linear-gradient(to top, white 82%, rgba(255, 255, 255, 0));
 }
 
 .composer {
   position: relative;
   width: min(880px, 100%);
+  min-height: 132px;
   margin: 0 auto;
-  padding: 9px 10px 8px;
+  padding: 16px 17px 13px;
   border: 1px solid var(--line-strong);
-  border-radius: 16px;
-  background: white;
-  box-shadow: 0 8px 30px rgba(30, 32, 29, 0.1);
+  border-radius: 24px;
+  background: #fbfbfa;
+  box-shadow: 0 10px 34px rgba(30, 32, 29, 0.11);
 }
 
 .composer:focus-within {
@@ -1082,16 +1162,16 @@ select:focus-visible {
 .composer > textarea {
   display: block;
   width: 100%;
-  min-height: 38px;
+  min-height: 58px;
   max-height: 180px;
   resize: none;
-  padding: 7px 7px 5px;
+  padding: 2px 3px 10px;
   border: 0;
   outline: 0;
   background: transparent;
   color: var(--ink);
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: 15px;
+  line-height: 1.6;
 }
 
 .composer > textarea::placeholder,
@@ -1104,7 +1184,7 @@ select:focus-visible {
 .composer-toolbar {
   justify-content: space-between;
   gap: 12px;
-  padding-top: 4px;
+  padding-top: 10px;
 }
 
 .composer-options {
@@ -1114,29 +1194,58 @@ select:focus-visible {
   gap: 5px;
 }
 
+.composer-context {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.composer-model {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--muted-strong);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .source-button,
 .settings-button {
-  min-height: 30px;
-  padding: 0 9px;
-  border-radius: 8px;
+  min-height: 34px;
+  padding: 0 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.035);
   font-size: 11px;
 }
 
 .send-button,
+.stop-button,
 .primary-button,
 .danger-button {
   border: 0;
-  border-radius: 9px;
+  border-radius: 999px;
   font-weight: 700;
 }
 
 .send-button {
-  min-width: 55px;
-  min-height: 32px;
-  padding: 0 12px;
+  min-width: 64px;
+  min-height: 42px;
+  padding: 0 15px;
   background: var(--ink);
   color: white;
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .send-button:hover:not(:disabled) {
@@ -1146,6 +1255,19 @@ select:focus-visible {
 .send-button:disabled {
   cursor: not-allowed;
   opacity: 0.42;
+}
+
+.stop-button {
+  min-width: 58px;
+  min-height: 42px;
+  padding: 0 13px;
+  background: var(--red-soft);
+  color: var(--red);
+  font-size: 12px;
+}
+
+.stop-button:hover {
+  background: #efd4d0;
 }
 
 .source-menu {
@@ -1256,9 +1378,9 @@ select:focus-visible {
 }
 
 .composer-note {
-  margin: 7px auto 0;
+  margin: 8px auto 0;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 10px;
   text-align: center;
 }
 
@@ -1440,6 +1562,38 @@ select:focus-visible {
 
   .composer-wrap {
     padding: 9px 10px 11px;
+  }
+
+  .composer {
+    min-height: 116px;
+    padding: 13px 13px 11px;
+    border-radius: 21px;
+  }
+
+  .composer > textarea {
+    min-height: 50px;
+    font-size: 14px;
+  }
+
+  .composer-toolbar {
+    align-items: flex-end;
+    gap: 8px;
+  }
+
+  .composer-model {
+    display: none;
+  }
+
+  .composer-actions {
+    margin-left: auto;
+  }
+
+  .tool-event-copy code {
+    display: none;
+  }
+
+  .tool-kind {
+    min-width: 38px;
   }
 
   .settings-panel {

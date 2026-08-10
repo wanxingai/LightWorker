@@ -6,9 +6,9 @@
     <meta name="color-scheme" content="light" />
     <title>LightWorker</title>
     <meta name="description" content="以聊天方式提交并观察通用任务。" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260811-3" />
-    <script src="/static/markdown.js?v=20260811-3" defer></script>
-    <script src="/static/app.js?v=20260811-3" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260811-4" />
+    <script src="/static/markdown.js?v=20260811-4" defer></script>
+    <script src="/static/app.js?v=20260811-4" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -97,6 +97,7 @@
                   </summary>
                   <div class="process-content">
                     <div class="assistant-intro" id="assistantIntro">正在准备隔离工作区…</div>
+                    <div class="activity-list" id="activityList"></div>
                     <div class="runtime-inspector is-hidden" id="runtimeInspector">
                       <details id="goalPanel">
                         <summary>Goal 与预算</summary>
@@ -117,7 +118,6 @@
                         </div>
                       </details>
                     </div>
-                    <div class="activity-list" id="activityList"></div>
                     <div class="verification-card is-hidden" id="verificationCard"></div>
                     <div class="run-error is-hidden" id="runError"></div>
                   </div>
@@ -145,6 +145,7 @@
         </section>
 
         <section class="composer-wrap">
+          <div class="process-progress is-hidden" id="processProgress" aria-live="polite"></div>
           <form class="composer" id="taskForm">
             <textarea
               id="taskInput"
@@ -171,7 +172,12 @@
                 </div>
                 <button class="settings-button" id="settingsButton" type="button" aria-expanded="false">运行设置</button>
               </div>
-              <button class="send-button" id="submitTaskButton" type="submit">提交</button>
+              <div class="composer-context is-hidden" id="composerContext">沿用当前工作区</div>
+              <div class="composer-actions">
+                <span class="composer-model" id="composerModel">正在连接模型…</span>
+                <button class="stop-button is-hidden" id="composerStopButton" type="button">停止</button>
+                <button class="send-button" id="submitTaskButton" type="submit">提交</button>
+              </div>
             </div>
             <div class="repo-row is-hidden" id="repoRow">
               <label for="repoInput">仓库绝对路径</label>
