@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 from LightAgent import RunResult
 
-from lightworker.config import RAGConfig, SkillsConfig, WorkerConfig
+import lightworker.browser_tools as browser_module
+from lightworker.browser_tools import BrowserTools
+from lightworker.config import BrowserConfig, RAGConfig, SkillsConfig, WorkerConfig
 from lightworker.context import ContextCompressor
 from lightworker.memory import WorkspaceMemory
-from lightworker.models import RunStatus, TaskSpec, VerificationCommand
+from lightworker.models import RunRecord, RunStatus, TaskSpec, VerificationCommand
 from lightworker.rag import RAGIndex
 from lightworker.sandbox import DockerSandbox
 from lightworker.sandbox_helper import HelperError, validate_shell_command
 from lightworker.skills import SkillRegistry
+from lightworker.storage import RunStore
+from lightworker.subagents import SubagentManager
+from lightworker.tool_protocol import EventLog
 from lightworker.workflow import CodingTaskRunner
 
 PATCH = """diff --git a/app.py b/app.py
@@ -134,6 +142,55 @@ class ExhaustedAgent(DynamicAgent):
         )
 
 
+class EvidenceExhaustedAgent:
+    name = "evidence-exhausted"
+
+    def run(self, query: str, **kwargs: Any) -> RunResult:
+        return RunResult(
+            content="Failed to generate a valid response.",
+            trace_id="first-attempt",
+            trace=[
+                {
+                    "type": "tool_result",
+                    "data": {
+                        "name": "http_get",
+                        "output": '{"ok":true,"url":"https://example.com/source","body":"evidence"}',
+                    },
+                },
+                {
+                    "type": "run_end",
+                    "data": {"success": False, "error": "max_retry_reached"},
+                },
+            ],
+        )
+
+
+class CapturingFinalizerAgent:
+    name = "capturing-finalizer"
+
+    def __init__(self, prompts: list[str]):
+        self.prompts = prompts
+
+    def run(self, query: str, **kwargs: Any) -> RunResult:
+        self.prompts.append(query)
+        assert kwargs["tools"] == []
+        return RunResult(
+            content="Recovered evidence report with https://example.com/source",
+            trace_id="second-attempt",
+            trace=[{"type": "run_end", "data": {"success": True}}],
+        )
+
+
+class SubagentRecoveryFactory:
+    def __init__(self):
+        self.finalizer_prompts: list[str] = []
+
+    def specialist(self, role: str, *, allowed_tools: set[str]) -> Any:
+        if allowed_tools:
+            return EvidenceExhaustedAgent()
+        return CapturingFinalizerAgent(self.finalizer_prompts)
+
+
 def agentic_config(tmp_path: Path, *, shell: bool = False) -> WorkerConfig:
     return WorkerConfig(
         state_dir=tmp_path / "state",
@@ -237,6 +294,75 @@ def test_agentic_runtime_recovers_tool_loop_exhaustion_with_tool_free_finalizer(
     events = runner.store.artifact_path(record.run_id, "events.jsonl").read_text()
     assert "final_answer_recovery_started" in events
     assert '"valid": true' in events
+
+
+def test_subagent_recovers_exhausted_tool_loop_from_captured_evidence(tmp_path: Path):
+    store = RunStore(tmp_path / "state")
+    run_id = "subagent-recovery"
+    store.create(RunRecord(run_id=run_id, task="research", repo="/workspace"))
+    events = EventLog(store, run_id)
+    factory = SubagentRecoveryFactory()
+    manager = SubagentManager(
+        agent_factory=factory,
+        tools=[],
+        store=store,
+        run_id=run_id,
+        events=events,
+    )
+
+    result = json.loads(manager.delegate_task("research", "Collect current market evidence"))
+
+    assert result["ok"] is True
+    assert result["results"][0]["ok"] is True
+    assert result["results"][0]["recovered"] is True
+    assert result["results"][0]["error"] is None
+    assert "https://example.com/source" in factory.finalizer_prompts[0]
+    agent_id = result["results"][0]["agent_id"]
+    assert store.artifact_path(run_id, f"subagents/{agent_id}/attempt-1-trace.jsonl").is_file()
+    assert store.artifact_path(run_id, f"subagents/{agent_id}/attempt-2-trace.jsonl").is_file()
+    tree = store.read_json(run_id, "agent-tree.json")
+    assert tree["agents"][0]["status"] == "completed"
+    assert tree["agents"][0]["recovered"] is True
+    event_text = store.artifact_path(run_id, "events.jsonl").read_text()
+    assert "subagent_recovery_started" in event_text
+    assert "subagent_recovery_completed" in event_text
+
+
+def test_browser_backend_runs_on_one_dedicated_thread_outside_asyncio_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend_threads: list[int] = []
+
+    class ThreadBoundBackend:
+        def __init__(self, config: BrowserConfig):
+            backend_threads.append(threading.get_ident())
+
+        def open(self, url: str) -> dict[str, Any]:
+            backend_threads.append(threading.get_ident())
+            return {"ok": True, "url": url}
+
+        def close(self) -> None:
+            backend_threads.append(threading.get_ident())
+
+    monkeypatch.setattr(browser_module, "PlaywrightBackend", ThreadBoundBackend)
+    tools = BrowserTools(
+        config=BrowserConfig(),
+        store=RunStore(tmp_path / "state"),
+        run_id="browser-thread",
+    )
+
+    async def call_from_event_loop() -> dict[str, Any]:
+        return json.loads(tools.browser_open("https://example.com/"))
+
+    try:
+        result = asyncio.run(call_from_event_loop())
+    finally:
+        tools.close()
+
+    assert result["ok"] is True
+    assert len(set(backend_threads)) == 1
+    assert backend_threads[0] != threading.get_ident()
 
 
 def test_rag_fts5_incremental_ingest_search_and_remove(tmp_path: Path):

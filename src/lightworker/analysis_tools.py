@@ -105,6 +105,7 @@ class AnalysisTools:
         self.root_run_id = root_run_id
         self.vault = vault
         self.request_count = 0
+        self._request_lock = threading.Lock()
         self.tools = (
             [self.web_search, self.http_get, self.http_action, self.http_request] if config.allow_http else []
         )
@@ -258,8 +259,10 @@ class AnalysisTools:
         json_body: dict[str, Any] | None = None,
         _raw_html: bool = False,
     ) -> str:
-        self.request_count += 1
-        if self.request_count > self.config.max_requests:
+        with self._request_lock:
+            self.request_count += 1
+            request_number = self.request_count
+        if request_number > self.config.max_requests:
             return self._result({"ok": False, "error": "analysis HTTP request limit exceeded"})
         try:
             target = self._validated_url(url, params or {})
@@ -341,9 +344,7 @@ class AnalysisTools:
                             "snippet": self._plain_html(str(item.findtext("description") or "")),
                             "published": str(item.findtext("pubDate") or "").strip(),
                             "source": str(source.text or "").strip() if source is not None else "",
-                            "source_url": str(source.get("url") or "").strip()
-                            if source is not None
-                            else "",
+                            "source_url": str(source.get("url") or "").strip() if source is not None else "",
                         }
                     )
                 if results:

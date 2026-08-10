@@ -201,6 +201,7 @@ export LIGHTWORKER_EMBEDDING_API_KEY="..."
 
 - `run.json`、`goal.json`、`working-memory.json`、`control.json`；
 - `events.jsonl`、`trace.jsonl`、`agent-tree.json`、`tool-manifest.json`；
+- `subagents/<agent-id>/attempt-*-trace.jsonl`：子 Agent 首次执行与证据合成恢复的独立 Trace；
 - `summary.md`；
 - 仅有文件变更时使用的 `changes.patch` 和 `git-status.txt`；
 - `verification-*.json`、`logs/*.log`；

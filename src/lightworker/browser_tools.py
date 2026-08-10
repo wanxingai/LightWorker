@@ -10,6 +10,7 @@ import tempfile
 import threading
 import urllib.parse
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -244,6 +245,9 @@ class BrowserTools:
         self.backend: BrowserBackend | None = None
         self.resource_semaphore = resource_semaphore
         self._slot_acquired = False
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lightworker-browser")
+        self._state_lock = threading.RLock()
+        self._closed = False
         self.screenshot_count = 0
         self.tools = [
             self.browser_open,
@@ -270,7 +274,7 @@ class BrowserTools:
                 raise
         return self.backend
 
-    def close(self) -> None:
+    def _close_backend(self) -> None:
         if self.backend is not None:
             try:
                 self.backend.close()
@@ -280,9 +284,27 @@ class BrowserTools:
                     self.resource_semaphore.release()
                     self._slot_acquired = False
 
-    def _result(self, function: Any, *args: Any) -> str:
+    def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
         try:
-            return json.dumps(function(*args), ensure_ascii=False)
+            self._executor.submit(self._close_backend).result()
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def _call_backend(self, operation: str, *args: Any) -> dict[str, Any]:
+        function = getattr(self._backend(), operation)
+        return function(*args)
+
+    def _result(self, operation: str, *args: Any) -> str:
+        try:
+            with self._state_lock:
+                if self._closed:
+                    raise RuntimeError("browser session is closed")
+                future = self._executor.submit(self._call_backend, operation, *args)
+            return json.dumps(future.result(), ensure_ascii=False)
         except Exception as exc:
             return json.dumps(
                 {"ok": False, "error": str(exc), "error_type": type(exc).__name__},
@@ -298,7 +320,7 @@ class BrowserTools:
         timeout_seconds=180,
     )
     def browser_open(self, url: str) -> str:
-        return self._result(self._backend().open, url)
+        return self._result("open", url)
 
     @tool_info(
         "browser_click",
@@ -319,7 +341,7 @@ class BrowserTools:
         approval_check=_sensitive_selector,
     )
     def browser_click(self, selector: str) -> str:
-        return self._result(self._backend().click, selector)
+        return self._result("click", selector)
 
     @tool_info(
         "browser_type",
@@ -340,7 +362,7 @@ class BrowserTools:
         network_required=True,
     )
     def browser_type(self, selector: str, text: str, clear: bool = True) -> str:
-        return self._result(self._backend().type_text, selector, text, clear)
+        return self._result("type_text", selector, text, clear)
 
     @tool_info(
         "browser_select",
@@ -359,7 +381,7 @@ class BrowserTools:
         network_required=True,
     )
     def browser_select(self, selector: str, value: str) -> str:
-        return self._result(self._backend().select, selector, value)
+        return self._result("select", selector, value)
 
     @tool_info(
         "browser_extract",
@@ -371,11 +393,11 @@ class BrowserTools:
         category=ToolCategory.BROWSER,
     )
     def browser_extract(self, selector: str = "body", limit: int = 20) -> str:
-        return self._result(self._backend().extract, selector, max(1, min(limit, 100)))
+        return self._result("extract", selector, max(1, min(limit, 100)))
 
     @tool_info("browser_tabs", "List open ephemeral browser tabs.", [], category=ToolCategory.BROWSER)
     def browser_tabs(self) -> str:
-        return self._result(self._backend().tabs)
+        return self._result("tabs")
 
     @tool_info(
         "browser_screenshot",
@@ -386,10 +408,11 @@ class BrowserTools:
         is_write=True,
     )
     def browser_screenshot(self, full_page: bool = True) -> str:
-        self.screenshot_count += 1
-        relative = f"browser/screenshot-{self.screenshot_count}.png"
+        with self._state_lock:
+            self.screenshot_count += 1
+            relative = f"browser/screenshot-{self.screenshot_count}.png"
         path = self.store.artifact_path(self.run_id, relative)
-        result = self._result(self._backend().screenshot, path, full_page)
+        result = self._result("screenshot", path, full_page)
         try:
             payload = json.loads(result)
         except json.JSONDecodeError:

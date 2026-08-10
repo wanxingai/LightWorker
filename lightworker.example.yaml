@@ -40,7 +40,7 @@ analysis:
   allow_http: true
   # Empty means any public HTTPS host; credentials remain bound to the host supplied with them.
   allowed_hosts: []
-  max_requests: 12
+  max_requests: 32
   request_timeout_seconds: 30
   max_response_bytes: 262144
   search_enabled: true

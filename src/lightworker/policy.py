@@ -61,6 +61,17 @@ def make_policy_hooks(*, allowed_tools: set[str]) -> list[Any]:
                 return HookDecision.block(f"tool is not authorized for this agent: {tool_name}")
         if ctx.phase == "before_model_request":
             params = redact_value(dict(ctx.payload.get("params") or {}))
+            authorized_schemas = []
+            for schema in params.get("tools") or []:
+                function = schema.get("function") if isinstance(schema, dict) else None
+                tool_name = str((function or {}).get("name") or "")
+                if tool_name in allowed_tools and tool_name not in BLOCKED_BUILTIN_TOOLS:
+                    authorized_schemas.append(schema)
+            if authorized_schemas:
+                params["tools"] = authorized_schemas
+            else:
+                params.pop("tools", None)
+                params.pop("tool_choice", None)
             return HookDecision.replace({"params": params})
         if ctx.phase == "after_tool_result":
             return HookDecision.replace(

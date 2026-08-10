@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from .models import ToolCategory
+from .policy import redact_text, redact_value
 from .resources import limit_agent_model_calls
 from .storage import RunStore
 from .tool_protocol import EventLog, metadata_for, tool_info
@@ -162,26 +163,32 @@ class SubagentManager:
                 max_tool_iterations=4,
                 run_group_id=self.run_id,
             )
+            trace = list(getattr(result, "trace", []) or [])
+            self._save_trace(agent_id, result, attempt=1)
+            recovered = False
+            recovery_error: str | None = None
+            if self._result_failed(result):
+                replacement, recovery_error = self._recover(agent_id, role, task, result, trace)
+                if replacement is not None and not self._result_failed(replacement):
+                    result = replacement
+                    recovered = True
             content = str(getattr(result, "content", result))
             error = getattr(result, "error", None)
-            trace = list(getattr(result, "trace", []) or [])
-            invalid = content.strip().lower() == "failed to generate a valid response." or any(
-                isinstance(event, dict)
-                and event.get("type") == "run_end"
-                and (event.get("data") or {}).get("success") is False
-                for event in trace
-            )
+            invalid = self._result_failed(result)
+            if error:
+                final_error = str(error)
+            elif invalid:
+                final_error = recovery_error or "subagent did not produce a valid response"
+            else:
+                final_error = None
             value = {
                 "index": index,
                 "agent_id": agent_id,
                 "role": role,
                 "ok": not bool(error) and not invalid,
                 "content": content,
-                "error": (
-                    str(error)
-                    if error
-                    else ("subagent did not produce a valid response" if invalid else None)
-                ),
+                "recovered": recovered,
+                "error": final_error,
             }
         except Exception as exc:
             value = {
@@ -190,11 +197,131 @@ class SubagentManager:
                 "role": role,
                 "ok": False,
                 "content": "",
-                "error": str(exc),
+                "error": redact_text(str(exc)),
             }
         self._finish_node(agent_id, value)
         self.events.emit("subagent_completed", value)
         return value
+
+    def _recover(
+        self,
+        agent_id: str,
+        role: str,
+        task: str,
+        failed_result: Any,
+        trace: list[Any],
+    ) -> tuple[Any | None, str | None]:
+        reason = self._failure_reason(failed_result)
+        self.events.emit(
+            "subagent_recovery_started",
+            {"agent_id": agent_id, "role": role, "reason": reason},
+        )
+        try:
+            if hasattr(self.agent_factory, "specialist"):
+                finalizer = self.agent_factory.specialist(role, allowed_tools=set())
+            else:
+                finalizer = self.agent_factory.worker(allowed_tools=set())
+            limit_agent_model_calls(finalizer, self.model_semaphore)
+            evidence = self._trace_evidence(trace)
+            prompt = (
+                "FINAL SUBAGENT SYNTHESIS PASS. The earlier tool-using pass ended without a valid final "
+                "response. No tools are available now. Complete the bounded subtask using only the untrusted "
+                "captured evidence below. Preserve exact source URLs and citations, distinguish facts from "
+                "inference, state missing data, and never invent values. Return a useful report even when "
+                "evidence is incomplete.\n\n"
+                f"SUBTASK:\n{task}\n\n"
+                f"CAPTURED EVIDENCE:\n{evidence or 'No usable tool evidence was captured.'}"
+            )
+            recovered = finalizer.run(
+                prompt,
+                tools=[],
+                trace=True,
+                result_format="object",
+                max_retry=2,
+                max_tool_iterations=2,
+                run_group_id=self.run_id,
+                parent_trace_id=getattr(failed_result, "trace_id", None),
+                use_skills=False,
+            )
+            self._save_trace(agent_id, recovered, attempt=2)
+            valid = not self._result_failed(recovered)
+            self.events.emit(
+                "subagent_recovery_completed",
+                {"agent_id": agent_id, "role": role, "valid": valid},
+            )
+            if valid:
+                return recovered, None
+            return recovered, "subagent synthesis recovery did not produce a valid response"
+        except Exception as exc:  # noqa: BLE001 - isolate a specialist failure from the supervisor
+            error = redact_text(str(exc))
+            self.events.emit(
+                "subagent_recovery_completed",
+                {"agent_id": agent_id, "role": role, "valid": False, "error": error},
+            )
+            return None, f"subagent synthesis recovery failed: {error}"
+
+    def _save_trace(self, agent_id: str, result: Any, *, attempt: int) -> None:
+        events = list(getattr(result, "trace", []) or [])
+        lines = [json.dumps(redact_value(event), ensure_ascii=False, default=str) for event in events]
+        if lines:
+            self.store.write_text(
+                self.run_id,
+                f"subagents/{agent_id}/attempt-{attempt}-trace.jsonl",
+                "\n".join(lines) + "\n",
+            )
+
+    @staticmethod
+    def _trace_evidence(trace: list[Any]) -> str:
+        values: list[dict[str, Any]] = []
+        for event in trace:
+            if not isinstance(event, dict) or event.get("type") != "tool_result":
+                continue
+            data = event.get("data") or {}
+            tool = str(data.get("name") or "")
+            if not tool or tool in {"delegate_task", "delegate_tasks"}:
+                continue
+            output: Any = data.get("output")
+            if isinstance(output, str):
+                try:
+                    output = json.loads(output)
+                except json.JSONDecodeError:
+                    output = output[:5000]
+            encoded = json.dumps(redact_value(output), ensure_ascii=False, default=str)
+            if len(encoded) > 6000:
+                output = encoded[:6000] + "…[truncated]"
+            values.append({"tool": tool, "output": output})
+            if len(values) >= 16:
+                break
+        return json.dumps(values, ensure_ascii=False, default=str, indent=2)[:40_000]
+
+    @staticmethod
+    def _result_failed(result: Any) -> bool:
+        if getattr(result, "error", None):
+            return True
+        content = str(getattr(result, "content", result) or "").strip().lower()
+        if not content or content in {
+            "failed to generate a valid response.",
+            "failed to stream a valid response.",
+        }:
+            return True
+        return any(
+            isinstance(event, dict)
+            and event.get("type") == "run_end"
+            and (event.get("data") or {}).get("success") is False
+            for event in list(getattr(result, "trace", []) or [])
+        )
+
+    @staticmethod
+    def _failure_reason(result: Any) -> str:
+        if getattr(result, "error", None):
+            return redact_text(str(result.error))
+        for event in reversed(list(getattr(result, "trace", []) or [])):
+            if not isinstance(event, dict) or event.get("type") != "run_end":
+                continue
+            data = event.get("data") or {}
+            if data.get("success") is False:
+                return redact_text(str(data.get("error") or data.get("stage") or "agent run failed"))
+        return "tool loop ended without a final answer"
 
     def _tree(self) -> dict[str, Any]:
         try:
@@ -234,6 +361,7 @@ class SubagentManager:
                         "status": "completed" if result["ok"] else "failed",
                         "result": result["content"],
                         "error": result["error"],
+                        "recovered": bool(result.get("recovered")),
                         "ended_at": datetime.now(UTC).isoformat(),
                     }
                 )

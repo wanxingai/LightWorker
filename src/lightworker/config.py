@@ -90,7 +90,7 @@ class AnalysisConfig(BaseModel):
     enabled: bool = True
     allow_http: bool = True
     allowed_hosts: list[str] = Field(default_factory=list)
-    max_requests: int = Field(default=12, ge=1, le=50)
+    max_requests: int = Field(default=32, ge=1, le=50)
     request_timeout_seconds: int = Field(default=30, ge=1, le=120)
     max_response_bytes: int = Field(default=262_144, ge=4096, le=2_097_152)
     search_enabled: bool = True

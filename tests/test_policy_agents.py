@@ -65,6 +65,41 @@ def test_policy_blocks_builtin_and_unlisted_tools():
     assert allowed is None
 
 
+def test_policy_removes_unauthorized_tool_schemas_before_model_request():
+    hook = make_policy_hooks(allowed_tools={"read_file"})[0].handler
+
+    def schema(name: str) -> dict[str, object]:
+        return {"type": "function", "function": {"name": name, "parameters": {}}}
+
+    decision = hook(
+        HookContext(
+            phase="before_model_request",
+            payload={
+                "params": {
+                    "tools": [
+                        schema("read_file"),
+                        schema("execute_python_code"),
+                        schema("delete_file"),
+                    ],
+                    "tool_choice": "auto",
+                }
+            },
+        )
+    )
+    params = decision.payload["params"]
+
+    assert [item["function"]["name"] for item in params["tools"]] == ["read_file"]
+
+    no_tools = make_policy_hooks(allowed_tools=set())[0].handler(
+        HookContext(
+            phase="before_model_request",
+            payload={"params": {"tools": [schema("execute_python_code")], "tool_choice": "auto"}},
+        )
+    )
+    assert "tools" not in no_tools.payload["params"]
+    assert "tool_choice" not in no_tools.payload["params"]
+
+
 def test_redaction_hides_common_tokens():
     value = redact_text("api_key=supersecret sk-abcdefghijklmnopqrstuvwxyz")
     assert "supersecret" not in value
