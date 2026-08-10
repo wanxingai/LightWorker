@@ -394,9 +394,7 @@ def test_pending_flow_approval_is_exposed_and_submitted(tmp_path: Path):
     assert detail.json()["approval_request"]["request_id"] == "request-1"
     assert detail.json()["approval_request"]["step"] == "edit"
     assert decision.status_code == 202
-    assert CapturingRunner.approvals == [
-        ("approval-run", "edit", "approved", "Proceed carefully")
-    ]
+    assert CapturingRunner.approvals == [("approval-run", "edit", "approved", "Proceed carefully")]
 
 
 def test_running_detail_derives_current_flow_step(tmp_path: Path):

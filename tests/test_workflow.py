@@ -243,9 +243,7 @@ def test_high_risk_edit_waits_for_durable_approval(git_repo: Path, tmp_path: Pat
     )
 
     waiting = runner.run(spec)
-    flow_record = json.loads(
-        runner.store.artifact_path(spec.run_id, f"flow/{spec.run_id}.json").read_text()
-    )
+    flow_record = json.loads(runner.store.artifact_path(spec.run_id, f"flow/{spec.run_id}.json").read_text())
 
     assert waiting.status == RunStatus.NEEDS_ATTENTION
     assert waiting.current_step == "approval:execute"
@@ -332,9 +330,7 @@ def test_domain_label_does_not_block_workspace_execution(git_repo: Path, tmp_pat
     )
 
     record = runner.run(spec)
-    flow_record = json.loads(
-        runner.store.artifact_path(spec.run_id, f"flow/{spec.run_id}.json").read_text()
-    )
+    flow_record = json.loads(runner.store.artifact_path(spec.run_id, f"flow/{spec.run_id}.json").read_text())
 
     assert record.status == RunStatus.SUCCEEDED
     assert record.error is None

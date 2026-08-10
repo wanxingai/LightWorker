@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light" />
     <title>LightWorker</title>
     <meta name="description" content="以聊天方式提交并观察通用任务。" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260810-2" />
-    <script src="/static/app.js?v=20260810-2" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260811-1" />
+    <script src="/static/app.js?v=20260811-1" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -53,6 +53,8 @@
           </div>
           <div class="header-actions">
             <span class="run-status is-hidden" id="runStatus">—</span>
+            <button class="quiet-button is-hidden" id="pauseButton" type="button">暂停</button>
+            <button class="quiet-button danger-text is-hidden" id="cancelButton" type="button">取消</button>
             <button class="quiet-button is-hidden" id="resumeButton" type="button">恢复</button>
             <button class="quiet-button is-hidden" id="rerunButton" type="button">重新验证</button>
           </div>
@@ -86,6 +88,26 @@
               <div class="message-body">
                 <div class="message-label">LightWorker</div>
                 <div class="assistant-intro" id="assistantIntro">正在准备隔离工作区…</div>
+                <div class="runtime-inspector is-hidden" id="runtimeInspector">
+                  <details id="goalPanel">
+                    <summary>Goal 与预算</summary>
+                    <pre id="goalContent"></pre>
+                  </details>
+                  <details id="agentPanel">
+                    <summary>Agent 树</summary>
+                    <div id="agentTreeContent"></div>
+                  </details>
+                  <details id="browserPanel">
+                    <summary>浏览器截图</summary>
+                    <div class="browser-gallery" id="browserGallery"></div>
+                  </details>
+                  <details id="resourcesPanel">
+                    <summary>Memory · Skills · RAG · MCP</summary>
+                    <div class="resource-manager" id="resourcesContent">
+                      <button class="text-button" id="loadResourcesButton" type="button">加载资源</button>
+                    </div>
+                  </details>
+                </div>
                 <div class="activity-list" id="activityList"></div>
                 <div class="verification-card is-hidden" id="verificationCard"></div>
                 <section class="answer-block is-hidden" id="summaryBlock">
@@ -145,6 +167,18 @@
               <input id="repoInput" name="repo" placeholder="/Users/you/projects/example" autocomplete="off" />
             </div>
             <div class="settings-panel is-hidden" id="settingsPanel">
+              <label>
+                <span>运行模式</span>
+                <select id="runtimeModeInput">
+                  <option value="agentic" selected>动态 Agentic Loop</option>
+                  <option value="workflow">固定 Workflow</option>
+                </select>
+                <small>同一入口支持任意任务；Workflow 仅用于需要固定阶段的场景</small>
+              </label>
+              <label class="checkbox-row">
+                <input id="goalModeInput" type="checkbox" checked />
+                <span>启用 Goal 长任务状态与预算</span>
+              </label>
               <label>
                 <span>测试命令</span>
                 <input id="testInput" value="pytest -q" placeholder="pytest -q" autocomplete="off" />

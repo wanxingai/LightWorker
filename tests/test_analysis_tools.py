@@ -110,3 +110,72 @@ def test_http_tool_injects_host_bound_credential_without_logging_it(
     audit = store.artifact_path("analysis-run", "logs/http-1.log").read_text()
     assert secret not in audit
     assert "evidence" in audit
+
+
+def test_html_response_is_simplified_for_model_context(tmp_path: Path):
+    store = RunStore(tmp_path / "state")
+    store.create(RunRecord(run_id="analysis-run", task="test", repo="/repo"))
+    tool = AnalysisTools(
+        config=AnalysisConfig(),
+        store=store,
+        run_id="analysis-run",
+        root_run_id="analysis-run",
+        vault=CredentialVault(tmp_path / "state"),
+    )
+    result = tool._simplify_html_result(
+        {
+            "ok": True,
+            "status": 200,
+            "url": "https://example.com/news",
+            "body": (
+                "<html><head><title>Market News</title>"
+                '<meta name="description" content="Daily evidence"></head>'
+                "<body><script>hugeNoise()</script><p>LPG inventories fell.</p>"
+                '<a href="/source">Source</a></body></html>'
+            ),
+        }
+    )
+
+    assert result["html_simplified"] is True
+    assert "Market News" in result["body"]
+    assert "LPG inventories fell" in result["body"]
+    assert "hugeNoise" not in result["body"]
+    assert "https://example.com/source" in result["body"]
+
+
+def test_web_search_falls_back_to_google_news_rss(tmp_path: Path, monkeypatch: Any):
+    store = RunStore(tmp_path / "state")
+    store.create(RunRecord(run_id="analysis-run", task="test", repo="/repo"))
+    tool = AnalysisTools(
+        config=AnalysisConfig(),
+        store=store,
+        run_id="analysis-run",
+        root_run_id="analysis-run",
+        vault=CredentialVault(tmp_path / "state"),
+    )
+    responses = iter(
+        [
+            json.dumps({"ok": True, "status": 202, "body": "human challenge"}),
+            json.dumps(
+                {
+                    "ok": True,
+                    "status": 200,
+                    "body": (
+                        "<rss><channel><item><title>Iran update</title>"
+                        "<link>https://news.example/item</link>"
+                        "<description>Verified report</description>"
+                        "<pubDate>Mon, 10 Aug 2026 10:00:00 GMT</pubDate>"
+                        '<source url="https://news.example">Example News</source>'
+                        "</item></channel></rss>"
+                    ),
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(tool, "http_request", lambda *args, **kwargs: next(responses))
+
+    result = json.loads(tool.web_search("US Iran latest"))
+
+    assert result["ok"] is True
+    assert result["provider"] == "google_news_rss_fallback"
+    assert result["results"][0]["source"] == "Example News"

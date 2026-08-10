@@ -6,25 +6,18 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from .models import InstalledRequirement, RunRecord, VerificationCommand, VerificationResult
+from .models import (
+    ApprovalPolicy,
+    InstalledRequirement,
+    RunRecord,
+    ToolCategory,
+    VerificationCommand,
+    VerificationResult,
+)
 from .policy import redact_text
 from .sandbox import SandboxBackend, SandboxError
 from .storage import RunStore
-
-
-def tool_info(
-    name: str, description: str, params: list[dict[str, Any]]
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
-        function.tool_info = {  # type: ignore[attr-defined]
-            "tool_name": name,
-            "tool_title": name.replace("_", " ").title(),
-            "tool_description": description,
-            "tool_params": params,
-        }
-        return function
-
-    return decorate
+from .tool_protocol import tool_info
 
 
 class RepositoryTools:
@@ -44,7 +37,12 @@ class RepositoryTools:
         self.on_install = on_install
         self.verification_round = 0
         self.read_tools = [self.list_files, self.read_file, self.search_text, self.git_status, self.git_diff]
-        self.write_tools = [*self.read_tools, self.apply_patch, self.pip_install]
+        self.write_tools = [
+            *self.read_tools,
+            self.apply_patch,
+            self.apply_patch_risky,
+            self.pip_install,
+        ]
         self.review_tools = [self.read_file, self.git_status, self.git_diff]
 
     @tool_info(
@@ -59,6 +57,8 @@ class RepositoryTools:
             },
             {"name": "limit", "description": "Maximum files", "type": "integer", "required": False},
         ],
+        category=ToolCategory.WORKSPACE,
+        sandbox_required=True,
     )
     def list_files(self, path: str = ".", limit: int = 500) -> str:
         return self._model_result(self.sandbox.call("list_files", {"path": path, "limit": limit}))
@@ -86,6 +86,8 @@ class RepositoryTools:
                 "required": False,
             },
         ],
+        category=ToolCategory.WORKSPACE,
+        sandbox_required=True,
     )
     def read_file(self, path: str, start_line: int = 1, end_line: int = 0) -> str:
         return self._model_result(
@@ -114,6 +116,8 @@ class RepositoryTools:
                 "required": False,
             },
         ],
+        category=ToolCategory.WORKSPACE,
+        sandbox_required=True,
     )
     def search_text(
         self,
@@ -134,11 +138,23 @@ class RepositoryTools:
             )
         )
 
-    @tool_info("git_status", "Return the isolated workspace Git status.", [])
+    @tool_info(
+        "git_status",
+        "Return the isolated workspace Git status.",
+        [],
+        category=ToolCategory.WORKSPACE,
+        sandbox_required=True,
+    )
     def git_status(self) -> str:
         return self._model_result(self.sandbox.call("git_status", {}))
 
-    @tool_info("git_diff", "Return the current isolated workspace diff, capped for model context.", [])
+    @tool_info(
+        "git_diff",
+        "Return the current isolated workspace diff, capped for model context.",
+        [],
+        category=ToolCategory.WORKSPACE,
+        sandbox_required=True,
+    )
     def git_diff(self) -> str:
         return self._model_result(self.sandbox.call("git_diff", {"full": False}))
 
@@ -154,9 +170,44 @@ class RepositoryTools:
                 "required": True,
             }
         ],
+        category=ToolCategory.WORKSPACE,
+        is_read_only=False,
+        is_write=True,
+        concurrency_safe=False,
+        sandbox_required=True,
+        approval_policy=ApprovalPolicy.NEVER,
     )
     def apply_patch(self, patch: str) -> str:
         return self._model_result(self.sandbox.call("apply_patch", {"patch": patch}, timeout=120))
+
+    @tool_info(
+        "apply_patch_risky",
+        "Apply an approved unified Git patch that may delete or rename workspace files. Protected paths, "
+        "special files, path escapes, and size limits remain blocked.",
+        [
+            {
+                "name": "patch",
+                "description": "Unified diff including diff --git headers",
+                "type": "string",
+                "required": True,
+            }
+        ],
+        category=ToolCategory.WORKSPACE,
+        is_read_only=False,
+        is_write=True,
+        is_destructive=True,
+        concurrency_safe=False,
+        sandbox_required=True,
+        approval_policy=ApprovalPolicy.ALWAYS,
+    )
+    def apply_patch_risky(self, patch: str) -> str:
+        return self._model_result(
+            self.sandbox.call(
+                "apply_patch",
+                {"patch": patch, "allow_delete": True},
+                timeout=120,
+            )
+        )
 
     @tool_info(
         "pip_install",
@@ -172,6 +223,15 @@ class RepositoryTools:
                 "required": True,
             }
         ],
+        category=ToolCategory.SHELL,
+        is_read_only=False,
+        is_write=True,
+        external_side_effect=True,
+        concurrency_safe=False,
+        sandbox_required=True,
+        network_required=True,
+        approval_policy=ApprovalPolicy.ALWAYS,
+        timeout_seconds=900,
     )
     def pip_install(self, requirements: list[str]) -> str:
         response = self.sandbox.install_requirements(requirements)

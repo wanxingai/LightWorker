@@ -23,6 +23,55 @@ class RunStatus(StrEnum):
     NEEDS_ATTENTION = "needs_attention"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+    PAUSED = "paused"
+    WAITING_INPUT = "waiting_input"
+    WAITING_APPROVAL = "waiting_approval"
+    BUDGET_LIMITED = "budget_limited"
+    CANCELLED = "cancelled"
+
+
+class RuntimeMode(StrEnum):
+    AGENTIC = "agentic"
+    WORKFLOW = "workflow"
+
+
+class GoalStatus(StrEnum):
+    ACTIVE = "active"
+    WAITING_INPUT = "waiting_input"
+    WAITING_APPROVAL = "waiting_approval"
+    PAUSED = "paused"
+    BUDGET_LIMITED = "budget_limited"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class SubgoalStatus(StrEnum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+
+
+class ToolCategory(StrEnum):
+    WORKSPACE = "workspace"
+    SHELL = "shell"
+    NETWORK = "network"
+    BROWSER = "browser"
+    MEMORY = "memory"
+    SKILL = "skill"
+    MCP = "mcp"
+    RAG = "rag"
+    AGENT = "agent"
+    GOAL = "goal"
+
+
+class ApprovalPolicy(StrEnum):
+    NEVER = "never"
+    CONDITIONAL = "conditional"
+    ALWAYS = "always"
+    DISABLED = "disabled"
 
 
 class VerificationKind(StrEnum):
@@ -73,6 +122,8 @@ class TaskSpec(BaseModel):
     parent_run_id: str | None = None
     root_run_id: str | None = None
     conversation_context: str | None = None
+    runtime_mode: RuntimeMode = RuntimeMode.AGENTIC
+    goal_mode: bool = True
 
 
 class StepRecord(BaseModel):
@@ -103,6 +154,59 @@ class RunRecord(BaseModel):
     verification: list[VerificationResult] = Field(default_factory=list)
     installed_requirements: list[InstalledRequirement] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolMetadata(BaseModel):
+    category: ToolCategory = ToolCategory.WORKSPACE
+    is_read_only: bool = True
+    is_write: bool = False
+    is_destructive: bool = False
+    external_side_effect: bool = False
+    concurrency_safe: bool = True
+    sandbox_required: bool = False
+    network_required: bool = False
+    credential_scope: str | None = None
+    approval_policy: ApprovalPolicy = ApprovalPolicy.NEVER
+    timeout_seconds: int = Field(default=120, ge=1, le=3600)
+    output_limit_bytes: int = Field(default=32_768, ge=1024, le=2_097_152)
+
+
+class GoalBudget(BaseModel):
+    max_turns: int = Field(default=24, ge=1, le=500)
+    max_tool_calls: int = Field(default=80, ge=1, le=2000)
+    max_model_calls: int = Field(default=32, ge=1, le=500)
+    max_tokens: int | None = Field(default=None, ge=256)
+    max_seconds: int = Field(default=3600, ge=30, le=604_800)
+
+
+class GoalUsage(BaseModel):
+    turns: int = 0
+    tool_calls: int = 0
+    model_calls: int = 0
+    tokens: int = 0
+    elapsed_seconds: float = 0
+
+
+class Subgoal(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    objective: str
+    status: SubgoalStatus = SubgoalStatus.PENDING
+    owner: str | None = None
+    result: str | None = None
+
+
+class GoalState(BaseModel):
+    goal_id: str = Field(default_factory=lambda: uuid4().hex)
+    run_id: str
+    objective: str
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    status: GoalStatus = GoalStatus.ACTIVE
+    subgoals: list[Subgoal] = Field(default_factory=list)
+    budget: GoalBudget = Field(default_factory=GoalBudget)
+    usage: GoalUsage = Field(default_factory=GoalUsage)
+    waiting_reason: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class BilingualText(BaseModel):

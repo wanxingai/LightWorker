@@ -9,6 +9,7 @@ const STEP_LABELS = {
   execute: "执行任务",
   edit: "编辑文件",
   review: "复核变更",
+  agentic_loop: "动态 Agentic Loop",
 };
 const STATUS_LABELS = {
   created: "已创建",
@@ -18,6 +19,11 @@ const STATUS_LABELS = {
   needs_attention: "需要处理",
   failed: "失败",
   interrupted: "已中断",
+  paused: "已暂停",
+  waiting_input: "等待补充",
+  waiting_approval: "等待确认",
+  budget_limited: "预算已用尽",
+  cancelled: "已取消",
   success: "完成",
   pending: "等待",
   skipped: "跳过",
@@ -33,6 +39,9 @@ const state = {
   pollTimer: null,
   approvalRequestId: null,
   renderToken: 0,
+  eventSource: null,
+  eventRefreshTimer: null,
+  resourcesRunId: null,
 };
 
 const byId = (id) => document.getElementById(id);
@@ -183,6 +192,7 @@ async function loadRun(runId, { quiet = false } = {}) {
     if (state.currentRunId !== runId) return;
     state.currentRun = run;
     await renderRun(run, { forceScroll: changed });
+    connectEventStream(run);
     schedulePoll();
   } catch (error) {
     if (error.message.includes("run not found")) {
@@ -192,6 +202,27 @@ async function loadRun(runId, { quiet = false } = {}) {
     }
     if (!quiet) showToast(`加载任务详情失败：${error.message}`, true);
   }
+}
+
+function connectEventStream(run) {
+  if (!isBusy(run)) {
+    if (state.eventSource) state.eventSource.close();
+    state.eventSource = null;
+    return;
+  }
+  const expected = `/api/runs/${encodeURIComponent(run.run_id)}/events`;
+  if (state.eventSource?.url?.endsWith(expected)) return;
+  if (state.eventSource) state.eventSource.close();
+  const source = new EventSource(expected);
+  source.addEventListener("update", () => {
+    window.clearTimeout(state.eventRefreshTimer);
+    state.eventRefreshTimer = window.setTimeout(() => loadRun(run.run_id, { quiet: true }), 160);
+  });
+  source.onerror = () => {
+    source.close();
+    if (state.eventSource === source) state.eventSource = null;
+  };
+  state.eventSource = source;
 }
 
 async function renderRun(run, { forceScroll = false } = {}) {
@@ -211,6 +242,7 @@ async function renderRun(run, { forceScroll = false } = {}) {
   runStatus.classList.remove("is-hidden");
 
   renderActions(run);
+  renderRuntimeInspector(run);
   renderActivity(run.activity || [], run);
   renderVerification(isBusy(run) ? [] : (run.verification || []));
   renderError(run);
@@ -228,6 +260,155 @@ async function renderRun(run, { forceScroll = false } = {}) {
   if (!isBusy(run) && run.has_changes) jobs.push(loadDiff(run.run_id, renderToken));
   await Promise.allSettled(jobs);
   scrollConversation(forceScroll);
+}
+
+function renderRuntimeInspector(run) {
+  const inspector = byId("runtimeInspector");
+  const hasGoal = Boolean(run.goal);
+  const agents = run.agent_tree?.agents || [];
+  const screenshots = run.browser_artifacts || [];
+  inspector.classList.toggle("is-hidden", !run.unified_mode && !hasGoal && !agents.length && !screenshots.length);
+  byId("goalPanel").classList.toggle("is-hidden", !hasGoal);
+  byId("agentPanel").classList.toggle("is-hidden", !agents.length);
+  byId("browserPanel").classList.toggle("is-hidden", !screenshots.length);
+  byId("goalContent").textContent = hasGoal ? JSON.stringify(run.goal, null, 2) : "";
+
+  const tree = byId("agentTreeContent");
+  tree.replaceChildren();
+  agents.forEach((agent) => {
+    const item = document.createElement("div");
+    item.className = `agent-node status-${agent.status || "pending"}`;
+    item.style.marginLeft = `${Math.max(Number(agent.depth || 1) - 1, 0) * 18}px`;
+    const title = document.createElement("strong");
+    title.textContent = `${agent.role || "agent"} · ${agent.status || "pending"}`;
+    const task = document.createElement("span");
+    task.textContent = agent.task || "";
+    item.append(title, task);
+    tree.append(item);
+  });
+
+  const gallery = byId("browserGallery");
+  gallery.replaceChildren();
+  screenshots.forEach((name) => {
+    const link = document.createElement("a");
+    link.href = `/api/runs/${encodeURIComponent(run.run_id)}/browser/${encodeURIComponent(name)}`;
+    link.target = "_blank";
+    const image = document.createElement("img");
+    image.src = link.href;
+    image.alt = name;
+    link.append(image);
+    gallery.append(link);
+  });
+
+  if (state.resourcesRunId !== run.run_id) {
+    state.resourcesRunId = run.run_id;
+    const resources = byId("resourcesContent");
+    resources.replaceChildren();
+    const button = document.createElement("button");
+    button.className = "text-button";
+    button.type = "button";
+    button.textContent = "加载资源";
+    button.addEventListener("click", () => loadRuntimeResources(run.run_id));
+    resources.append(button);
+  }
+}
+
+async function loadRuntimeResources(runId) {
+  const root = byId("resourcesContent");
+  root.textContent = "正在加载…";
+  try {
+    const [memory, skills, rag, mcp] = await Promise.all([
+      api(`/api/runs/${encodeURIComponent(runId)}/memory`),
+      api(`/api/runs/${encodeURIComponent(runId)}/skills`),
+      api(`/api/runs/${encodeURIComponent(runId)}/rag`),
+      api("/api/mcp"),
+    ]);
+    if (state.currentRunId !== runId) return;
+    root.replaceChildren();
+    root.append(resourceHeading(`Memory (${memory.length})`));
+    memory.forEach((item) => {
+      const row = resourceRow(`${item.status} · ${item.kind}`, item.content);
+      if (item.status === "candidate") {
+        row.append(resourceButton("提升", async () => {
+          await api(`/api/runs/${encodeURIComponent(runId)}/memory/${encodeURIComponent(item.id)}/promote`, { method: "POST", body: "{}" });
+          await loadRuntimeResources(runId);
+        }));
+      }
+      row.append(resourceButton("删除", async () => {
+        await api(`/api/runs/${encodeURIComponent(runId)}/memory/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+        await loadRuntimeResources(runId);
+      }));
+      root.append(row);
+    });
+
+    root.append(resourceHeading(`Skills (${skills.skills?.length || 0})`));
+    (skills.skills || []).forEach((item) => root.append(resourceRow(`${item.name} · ${item.source}`, item.description)));
+
+    root.append(resourceHeading(`RAG (${rag.length})`));
+    const ingest = document.createElement("div");
+    ingest.className = "resource-ingest";
+    const input = document.createElement("input");
+    input.placeholder = "工作区文档路径，例如 docs/guide.md";
+    const ingestButton = resourceButton("索引", async () => {
+      const paths = input.value.split("\n").map((value) => value.trim()).filter(Boolean);
+      if (!paths.length) return;
+      await api(`/api/runs/${encodeURIComponent(runId)}/rag`, { method: "POST", body: JSON.stringify({ paths }) });
+      await loadRuntimeResources(runId);
+    });
+    ingest.append(input, ingestButton);
+    root.append(ingest);
+    rag.forEach((item) => {
+      const row = resourceRow(item.path, `${item.chunks} chunks`);
+      row.append(resourceButton("移除", async () => {
+        await api(`/api/runs/${encodeURIComponent(runId)}/rag?path=${encodeURIComponent(item.path)}`, { method: "DELETE" });
+        await loadRuntimeResources(runId);
+      }));
+      root.append(row);
+    });
+
+    const servers = Object.entries(mcp.servers || {});
+    root.append(resourceHeading(`MCP (${servers.length})`));
+    servers.forEach(([name, item]) => root.append(resourceRow(name, `${item.transport} · ${item.disabled ? "disabled" : "enabled"}`)));
+  } catch (error) {
+    root.textContent = `资源加载失败：${error.message}`;
+  }
+}
+
+function resourceHeading(text) {
+  const heading = document.createElement("strong");
+  heading.className = "resource-heading";
+  heading.textContent = text;
+  return heading;
+}
+
+function resourceRow(title, description) {
+  const row = document.createElement("div");
+  row.className = "resource-row";
+  const copy = document.createElement("span");
+  const strong = document.createElement("strong");
+  strong.textContent = title;
+  const detail = document.createElement("small");
+  detail.textContent = description || "";
+  copy.append(strong, detail);
+  row.append(copy);
+  return row;
+}
+
+function resourceButton(label, handler) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "text-button";
+  button.textContent = label;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await handler();
+    } catch (error) {
+      showToast(`资源操作失败：${error.message}`, true);
+      button.disabled = false;
+    }
+  });
+  return button;
 }
 
 function renderConversationHistory(turns, currentRunId) {
@@ -337,9 +518,11 @@ function renderActions(run) {
   const busy = isBusy(run);
   const hasApproval = Boolean(run.approval_request);
   const outOfScope = isOutOfScope(run);
+  byId("pauseButton").classList.toggle("is-hidden", !busy);
+  byId("cancelButton").classList.toggle("is-hidden", !busy);
   byId("resumeButton").classList.toggle(
     "is-hidden",
-    busy || hasApproval || outOfScope || run.general_only || run.analysis_only || !["failed", "interrupted"].includes(run.status),
+    busy || hasApproval || outOfScope || !["failed", "interrupted", "paused", "needs_attention"].includes(run.status),
   );
   byId("rerunButton").classList.toggle(
     "is-hidden",
@@ -578,12 +761,16 @@ function showNewTask() {
   state.renderToken += 1;
   state.approvalRequestId = null;
   window.clearTimeout(state.pollTimer);
+  if (state.eventSource) state.eventSource.close();
+  state.eventSource = null;
   renderRunList();
   byId("welcomeState").classList.remove("is-hidden");
   byId("conversation").classList.add("is-hidden");
   byId("chatTitle").textContent = "新任务";
   byId("chatMeta").textContent = "本机隔离执行";
   byId("runStatus").classList.add("is-hidden");
+  byId("pauseButton").classList.add("is-hidden");
+  byId("cancelButton").classList.add("is-hidden");
   byId("resumeButton").classList.add("is-hidden");
   byId("rerunButton").classList.add("is-hidden");
   if (byId("approvalDialog").open) byId("approvalDialog").close();
@@ -603,10 +790,6 @@ async function submitTask(event) {
   const task = byId("taskInput").value.trim();
   if (!task) return;
   const followup = Boolean(state.currentRunId);
-  if (followup && isBusy(state.currentRun)) {
-    showToast("请等待当前轮次完成后再继续追问", true);
-    return;
-  }
   const button = byId("submitTaskButton");
   button.disabled = true;
   button.textContent = followup ? "发送中" : "创建中";
@@ -623,6 +806,8 @@ async function submitTask(event) {
       lint_commands: lines(byId("lintInput").value),
       include_dirty: sourceMode === "existing" && byId("dirtyInput").checked,
       max_repairs: Number(byId("repairsInput").value),
+      runtime_mode: byId("runtimeModeInput").value,
+      goal_mode: byId("goalModeInput").checked,
     };
     const result = await api(path, {
       method: "POST",
@@ -654,10 +839,10 @@ function updateComposerMode(run) {
     ? "继续补充资料或追问，按 Enter 发送…"
     : "描述任意任务，按 Enter 提交…";
   byId("submitTaskButton").textContent = continuing ? "发送" : "提交";
-  byId("submitTaskButton").disabled = busy;
+  byId("submitTaskButton").disabled = false;
   if (continuing) {
     byId("composerNote").textContent = busy
-      ? "当前轮次执行中，完成后可继续补充资料"
+      ? "当前轮次执行中；发送内容会作为实时补充在下一个模型步骤生效"
       : "继续追问将沿用本对话上下文和上一轮隔离工作区";
   } else {
     updateSourceMode();
@@ -686,7 +871,13 @@ async function runAction(action) {
       method: "POST",
       body: "{}",
     });
-    showToast(action === "resume" ? "恢复任务已入队" : "重新验证已入队");
+    const labels = {
+      resume: "恢复任务已入队",
+      rerun: "重新验证已入队",
+      pause: "已请求暂停",
+      cancel: "已请求取消",
+    };
+    showToast(labels[action] || "操作已提交");
     await loadRun(state.currentRunId, { quiet: true });
   } catch (error) {
     showToast(`操作失败：${error.message}`, true);
@@ -757,6 +948,8 @@ function bindEvents() {
   document.querySelectorAll('input[name="sourceMode"]').forEach((input) => input.addEventListener("change", updateSourceMode));
   byId("resumeButton").addEventListener("click", () => runAction("resume"));
   byId("rerunButton").addEventListener("click", () => runAction("rerun"));
+  byId("pauseButton").addEventListener("click", () => runAction("pause"));
+  byId("cancelButton").addEventListener("click", () => runAction("cancel"));
   byId("approveApprovalButton").addEventListener("click", () => decideApproval("approved"));
   byId("rejectApprovalButton").addEventListener("click", () => decideApproval("rejected"));
   byId("sidebarOpenButton").addEventListener("click", () => document.body.classList.add("sidebar-open"));

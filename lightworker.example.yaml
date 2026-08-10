@@ -1,9 +1,31 @@
-# LightWorker Phase 0 example configuration.
+# LightWorker universal Agent runtime example configuration.
 # Keep API keys in LIGHTWORKER_API_KEY (or OPENAI_API_KEY), never in this file.
 
 image: lightworker-python:3.11
 language: bilingual
 max_repairs: 2
+
+runtime:
+  # Dynamic Agentic Loop is the default. Use workflow only for a deliberately fixed LightFlow.
+  mode: agentic
+  max_tool_iterations: 16
+  context_window_tokens: 64000
+  compression_ratio: 0.75
+  no_progress_limit: 4
+  goal_budget:
+    max_turns: 24
+    max_tool_calls: 80
+    max_model_calls: 32
+    # max_tokens: 200000
+    max_seconds: 3600
+
+scheduler:
+  max_tasks: 2
+  max_model_calls: 4
+  max_browsers: 2
+  max_containers: 4
+  # Global cap for the whole supervisor/subagent tree, not a per-node fan-out cap.
+  max_subagents: 8
 
 model:
   model: your-openai-compatible-model
@@ -21,6 +43,71 @@ analysis:
   max_requests: 12
   request_timeout_seconds: 30
   max_response_bytes: 262144
+  search_enabled: true
+  search_max_results: 8
+  max_concurrent_per_host: 2
+
+shell:
+  enabled: true
+  # Every model-requested shell_exec still requires exact-argument approval and runs only in Docker.
+  allowed_programs: [git, python, python3, pytest, ruff, mypy, uv, pip, pip3]
+  max_argv_items: 128
+
+browser:
+  enabled: true
+  # Playwright is the secure default. DrissionPage is optional and has separate licensing terms.
+  backend: playwright
+  headless: true
+  timeout_seconds: 30
+  max_pages: 8
+  allow_downloads: false
+  allowed_hosts: []
+  # Persistent login profiles are deliberately unavailable in the first release.
+  persistent_profiles: false
+
+memory:
+  enabled: true
+  # user_agents_file: ~/.lightworker/AGENTS.md
+  max_instruction_bytes: 131072
+  candidate_ttl_days: 30
+
+skills:
+  enabled: true
+  # Project skills are discovered from <workspace>/.lightworker/skills first.
+  user_directories: [~/.lightworker/skills]
+  managed_directories: []
+  max_skill_bytes: 262144
+  # Scripts still require approval and execute only in Docker with network disabled.
+  allow_scripts: true
+
+mcp:
+  enabled: true
+  allowed_hosts: []
+  servers: {}
+  # Example remote server:
+  # servers:
+  #   knowledge:
+  #     transport: streamable_http
+  #     url: https://mcp.example.com/mcp
+  #     headers:
+  #       Authorization: ${MCP_KNOWLEDGE_AUTHORIZATION}
+  #     read_only_tools: [search, read]
+  # Example stdio server (the command is transformed into docker exec, never run on the host):
+  #   local:
+  #     transport: stdio
+  #     command: python
+  #     args: [-m, my_mcp_server]
+
+rag:
+  enabled: true
+  chunk_tokens: 1000
+  chunk_overlap_tokens: 120
+  max_results: 8
+  embeddings_enabled: false
+  embedding_model: text-embedding-3-small
+  # embedding_base_url: https://your-embedding-endpoint.example/v1
+  embedding_api_key_env: LIGHTWORKER_EMBEDDING_API_KEY
+  embedding_batch_size: 64
 
 limits:
   cpus: 2

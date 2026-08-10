@@ -80,3 +80,44 @@ def make_policy_hooks(*, allowed_tools: set[str]) -> list[Any]:
             name="lightworker_fail_closed_policy",
         )
     ]
+
+
+def make_runtime_hook(*, control: Any, goal: Any, events: Any) -> Any:
+    """Create a fail-closed hook for pause/cancel, live steering, and goal budgets."""
+    if PolicyHook is None or HookDecision is None:
+        raise RuntimeError("LightAgent policy API is unavailable; install LightAgent>=0.9.7,<0.10")
+
+    def runtime(ctx: Any) -> Any:
+        if ctx.phase in {"before_model_request", "before_tool_call"}:
+            blocking = control.blocking_reason()
+            if blocking:
+                events.emit("runtime_blocked", {"phase": ctx.phase, "reason": blocking})
+                return HookDecision.block(blocking)
+            exceeded = goal.exceeded_budget()
+            if exceeded:
+                events.emit("budget_exceeded", {"phase": ctx.phase, "reason": exceeded})
+                return HookDecision.block(exceeded)
+        if ctx.phase == "before_model_request":
+            steering = control.consume_steering()
+            if steering:
+                params = dict(ctx.payload.get("params") or {})
+                messages = list(params.get("messages") or [])
+                for message in steering:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "LIVE USER STEERING / 用户实时补充（高优先级用户消息）:\n" + message,
+                        }
+                    )
+                params["messages"] = messages
+                events.emit("steering_consumed", {"messages": steering})
+                return HookDecision.replace({"params": params})
+        return None
+
+    return PolicyHook(
+        runtime,
+        phases={"before_model_request", "before_tool_call"},
+        failure_mode="block",
+        timeout=3.0,
+        name="lightworker_runtime_control",
+    )

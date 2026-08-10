@@ -16,6 +16,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -171,7 +172,7 @@ def apply_patch(params: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any
     if len(encoded) > maximum:
         raise HelperError(f"patch exceeds {maximum} byte limit")
     paths, deletes = extract_patch_paths(patch)
-    if deletes:
+    if deletes and not bool(params.get("allow_delete", False)):
         raise HelperError("file deletion is blocked in non-interactive mode")
     if not paths:
         raise HelperError("patch does not contain any file paths")
@@ -280,6 +281,67 @@ def run_command(params: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any
         "exit_code": result.returncode,
         "timed_out": timed_out,
         "duration_ms": duration_ms,
+        "output": cap(combined, policy),
+        "full_output": combined,
+    }
+
+
+def shell_exec(params: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    """Execute an approved argv vector in the container without invoking a shell."""
+    raw = params.get("argv")
+    if not isinstance(raw, list) or not raw or any(not isinstance(item, str) or not item for item in raw):
+        raise HelperError("argv must be a non-empty list of strings")
+    argv = list(raw)
+    validate_shell_command(argv, policy)
+    timeout = min(int(params.get("timeout") or 300), 3600)
+    started = time.perf_counter()
+    try:
+        result = run_command_raw(argv, timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired as exc:
+        result = subprocess.CompletedProcess(argv, 124, exc.stdout or "", exc.stderr or "")
+        timed_out = True
+    combined = (result.stdout or "") + (("\n" + result.stderr) if result.stderr else "")
+    return {
+        "argv": argv,
+        "exit_code": result.returncode,
+        "timed_out": timed_out,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+        "output": cap(combined, policy),
+        "full_output": combined,
+    }
+
+
+def run_skill_script(params: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    name = require_string(params, "name")
+    content = require_string(params, "content")
+    if len(content.encode("utf-8")) > 262_144:
+        raise HelperError("skill script exceeds 262144 byte limit")
+    if Path(name).name != name or Path(name).suffix.lower() not in {".py", ".sh"}:
+        raise HelperError("skill script name must be a safe .py or .sh basename")
+    raw_args = params.get("args") or []
+    if not isinstance(raw_args, list) or len(raw_args) > 64:
+        raise HelperError("skill script args must be a list with at most 64 items")
+    args = [str(item) for item in raw_args]
+    if any("\0" in item or len(item) > 4096 for item in args):
+        raise HelperError("skill script contains an invalid argument")
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="lightworker-skill-") as directory:
+        path = Path(directory) / name
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o700)
+        argv = ([sys.executable, str(path)] if path.suffix == ".py" else ["/bin/sh", str(path)]) + args
+        try:
+            result = run_command_raw(argv, timeout=min(int(params.get("timeout") or 300), 600))
+            timed_out = False
+        except subprocess.TimeoutExpired as exc:
+            result = subprocess.CompletedProcess(argv, 124, exc.stdout or "", exc.stderr or "")
+            timed_out = True
+    combined = (result.stdout or "") + (("\n" + result.stderr) if result.stderr else "")
+    return {
+        "exit_code": result.returncode,
+        "timed_out": timed_out,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 3),
         "output": cap(combined, policy),
         "full_output": combined,
     }
@@ -402,6 +464,40 @@ def validate_command(argv: list[str]) -> None:
     forbidden_tokens = {"--config-file", "--config", "--command", "-c"}
     if any(token in forbidden_tokens for token in argv[1:]):
         raise HelperError("command contains a blocked option")
+
+
+def validate_shell_command(argv: list[str], policy: dict[str, Any]) -> None:
+    maximum = int(policy.get("max_shell_argv_items") or 128)
+    if len(argv) > maximum or any("\0" in item or len(item) > 4096 for item in argv):
+        raise HelperError("shell argv exceeds configured bounds")
+    program = Path(argv[0]).name
+    allowed = {str(item) for item in policy.get("shell_allowed_programs") or []}
+    if program not in allowed:
+        raise HelperError(f"program is not allowed in the Docker shell: {program}")
+    if program in {"sh", "bash", "zsh", "fish", "sudo", "su", "docker", "podman"}:
+        raise HelperError("interactive shells and host-control programs are blocked")
+    if program == "git":
+        if len(argv) < 2 or argv[1] not in {
+            "status",
+            "diff",
+            "log",
+            "show",
+            "branch",
+            "rev-parse",
+            "ls-files",
+            "grep",
+            "blame",
+            "describe",
+            "check-ignore",
+        }:
+            raise HelperError("destructive or remote Git commands are blocked")
+    if program in {"python", "python3"}:
+        if any(item in {"-c", "-"} for item in argv[1:]):
+            raise HelperError("inline Python and stdin programs are blocked; use a workspace script")
+        if len(argv) >= 4 and argv[1:3] == ["-m", "pip"] and argv[3] in {"install", "uninstall"}:
+            raise HelperError("use the audited pip_install tool for dependency changes")
+    if program in {"pip", "pip3"} and len(argv) >= 2 and argv[1] in {"install", "uninstall"}:
+        raise HelperError("use the audited pip_install tool for dependency changes")
 
 
 def safe_path(relative: str, *, must_exist: bool) -> Path:
@@ -543,6 +639,8 @@ ACTIONS = {
     "git_status": git_status,
     "git_diff": git_diff,
     "run_command": run_command,
+    "shell_exec": shell_exec,
+    "run_skill_script": run_skill_script,
     "pip_check_requirements": pip_check_requirements,
     "pip_install": pip_install,
     "cleanup_processes": cleanup_processes,
