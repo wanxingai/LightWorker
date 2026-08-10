@@ -6,9 +6,9 @@
     <meta name="color-scheme" content="light" />
     <title>LightWorker</title>
     <meta name="description" content="以聊天方式提交并观察通用任务。" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260811-5" />
-    <script src="/static/markdown.js?v=20260811-5" defer></script>
-    <script src="/static/app.js?v=20260811-5" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260811-6" />
+    <script src="/static/markdown.js?v=20260811-6" defer></script>
+    <script src="/static/app.js?v=20260811-6" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -147,6 +147,13 @@
         </section>
 
         <section class="composer-wrap">
+          <section class="message-queue is-hidden" id="messageQueuePanel" aria-live="polite">
+            <div class="message-queue-heading">
+              <strong>排队任务</strong>
+              <span id="messageQueueCount">0 条等待</span>
+            </div>
+            <div class="message-queue-list" id="messageQueueList"></div>
+          </section>
           <div class="process-progress is-hidden" id="processProgress" aria-live="polite"></div>
           <form class="composer" id="taskForm">
             <textarea

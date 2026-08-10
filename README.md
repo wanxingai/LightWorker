@@ -107,7 +107,8 @@ uv run lightworker serve
 
 - 从空目录或已有 Git 仓库快照开始；
 - 选择动态 Agentic Loop 或固定 Workflow；
-- 执行中继续发送资料或 steering；
+- 执行中连续发送后续任务并按顺序排队；
+- 将任一排队消息切换为“引导”，立即注入当前任务的下一步规划；
 - 暂停、恢复或取消任务；
 - 查看工具输入/输出、审批、Goal、Agent 树、验证日志、浏览器截图和 Trace；
 - 管理 Workspace Memory、Skills、RAG 文档和 MCP 状态；

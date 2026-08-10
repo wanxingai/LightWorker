@@ -1234,6 +1234,112 @@ select:focus-visible {
   line-height: 1.55;
 }
 
+.message-queue {
+  width: min(880px, 100%);
+  max-height: 190px;
+  overflow: hidden;
+  margin: 0 auto 8px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(248, 248, 246, 0.96);
+  box-shadow: 0 8px 24px rgba(30, 32, 29, 0.07);
+}
+
+.message-queue-heading {
+  display: flex;
+  min-height: 35px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted-strong);
+  font-size: 11px;
+}
+
+.message-queue-heading strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.message-queue-list {
+  max-height: 154px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.message-queue-item {
+  display: grid;
+  min-height: 50px;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+}
+
+.message-queue-item + .message-queue-item {
+  border-top: 1px solid var(--line);
+}
+
+.message-queue-position {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 50%;
+  background: #e7e8e4;
+  color: var(--muted-strong);
+  font-size: 10px;
+  font-weight: 720;
+}
+
+.message-queue-item.status-running .message-queue-position {
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.message-queue-content {
+  min-width: 0;
+}
+
+.message-queue-content p {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.message-queue-content span {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.guide-button {
+  min-width: 48px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid #bed1c7;
+  border-radius: 999px;
+  background: #edf5f1;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.guide-button:hover:not(:disabled) {
+  background: #dfede6;
+}
+
+.guide-button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
 .composer-wrap {
   position: relative;
   z-index: 9;

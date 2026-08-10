@@ -28,6 +28,7 @@ from .context import ContextCompressor
 from .control import ControlStore
 from .goals import GoalManager
 from .memory import WorkspaceMemory, workspace_scope
+from .message_queue import ConversationMessageQueue
 from .models import (
     GoalBudget,
     RunRecord,
@@ -54,6 +55,12 @@ ARTIFACTS = {
     "status": ("git-status.txt", "text/plain; charset=utf-8"),
 }
 ACTIVE_STATUSES = {RunStatus.CREATED, RunStatus.PREPARING, RunStatus.RUNNING}
+QUEUE_BLOCKING_STATUSES = ACTIVE_STATUSES | {
+    RunStatus.NEEDS_ATTENTION,
+    RunStatus.PAUSED,
+    RunStatus.WAITING_INPUT,
+    RunStatus.WAITING_APPROVAL,
+}
 SAFE_LOG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.log$")
 SOURCE_URL = re.compile(r"https?://[^\s<>\[\]{}\"']+", re.IGNORECASE)
 SOURCE_TOOL_MARKERS = ("web_search", "http_", "browser_", "rag_search", "rag_read")
@@ -209,12 +216,16 @@ def create_app(
     own_manager = task_manager is None
     manager = task_manager or TaskScheduler(max_workers=settings.scheduler.max_tasks)
     store = RunStore(settings.state_dir)
+    message_queue = ConversationMessageQueue(store)
+    queue_dispatch_lock = threading.RLock()
     _migrate_legacy_credentials(store, settings.state_dir)
     _recover_stale_runs(store, manager)
     static_dir = Path(__file__).resolve().parent / "web_static"
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        for root_run_id in message_queue.roots():
+            _dispatch_next_queued_message(root_run_id)
         yield
         if own_manager:
             manager.close()
@@ -230,7 +241,158 @@ def create_app(
     app.state.settings = settings
     app.state.store = store
     app.state.task_manager = manager
+    app.state.message_queue = message_queue
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    def _run_blocks_queue(record: RunRecord, *, ignore_job: bool = False) -> bool:
+        job = manager.status(record.run_id)
+        return record.status in QUEUE_BLOCKING_STATUSES or bool(
+            not ignore_job and job and job.get("state") in {"queued", "running"}
+        )
+
+    def _prepare_followup_spec(
+        selected: RunRecord,
+        message: str,
+        *,
+        followup_id: str,
+    ) -> TaskSpec:
+        conversation = _conversation_records(store, selected)
+        parent = conversation[-1]
+        workspace = Path(parent.workspace or "").expanduser().resolve()
+        if not workspace.is_dir():
+            raise ValueError("saved workspace is missing")
+        try:
+            parent_spec = TaskSpec.model_validate(parent.metadata["task_spec"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError("saved task configuration is invalid") from exc
+
+        root = conversation[0]
+        sanitized, credentials = sanitize_and_capture_credentials(
+            [*[item.task for item in conversation], message]
+        )
+        CredentialVault(settings.state_dir).merge(root.run_id, credentials)
+        for record, safe_task in zip(conversation, sanitized[:-1], strict=True):
+            if record.task == safe_task:
+                continue
+            record.task = safe_task
+            record.metadata = redact_value(record.metadata)
+            store.save(record)
+        return TaskSpec(
+            run_id=followup_id,
+            repo=workspace,
+            task=sanitized[-1],
+            include_dirty=True,
+            language=parent_spec.language,
+            verification=parent_spec.verification,
+            max_repairs=parent_spec.max_repairs,
+            image=parent_spec.image,
+            source_mode=parent_spec.source_mode,
+            parent_run_id=parent.run_id,
+            root_run_id=root.run_id,
+            conversation_context=_build_conversation_context(store, conversation, settings),
+            runtime_mode=parent_spec.runtime_mode,
+            goal_mode=parent_spec.goal_mode,
+        )
+
+    def _submit_spec(
+        spec: TaskSpec,
+        action: str,
+        *,
+        queue_item_id: str | None = None,
+    ) -> None:
+        root_run_id = spec.root_run_id or spec.run_id
+
+        def execute() -> Any:
+            try:
+                return runner_factory(settings).run(spec)
+            finally:
+                _settle_queue_and_dispatch(root_run_id, spec.run_id, queue_item_id)
+
+        manager.submit(spec.run_id, action, execute)
+
+    def _settle_queue_and_dispatch(
+        root_run_id: str,
+        run_id: str,
+        queue_item_id: str | None,
+    ) -> None:
+        try:
+            record = store.load(run_id)
+        except (FileNotFoundError, ValueError) as exc:
+            if queue_item_id:
+                message_queue.complete(root_run_id, queue_item_id, error=str(exc))
+            return
+        if _run_blocks_queue(record, ignore_job=True):
+            return
+        if queue_item_id:
+            message_queue.complete(root_run_id, queue_item_id)
+        _dispatch_next_queued_message(root_run_id, finished_run_id=run_id)
+
+    def _dispatch_next_queued_message(
+        root_run_id: str,
+        *,
+        finished_run_id: str | None = None,
+    ) -> str | None:
+        with queue_dispatch_lock:
+            try:
+                root = store.load(root_run_id)
+            except (FileNotFoundError, ValueError):
+                return None
+            conversation = _conversation_records(store, root)
+            parent = conversation[-1]
+            if _run_blocks_queue(parent, ignore_job=parent.run_id == finished_run_id):
+                return None
+
+            active_items = message_queue.active(root_run_id)
+            running = next(
+                (item for item in active_items if item.get("status") == "running"),
+                None,
+            )
+            if running is not None:
+                queued_run_id = str(running.get("run_id") or "")
+                queued_job = manager.status(queued_run_id) if queued_run_id else None
+                try:
+                    queued_record = store.load(queued_run_id)
+                except (FileNotFoundError, ValueError):
+                    if queued_job and queued_job.get("state") in {"queued", "running"}:
+                        return queued_run_id
+                    message_queue.release(root_run_id, str(running["id"]))
+                else:
+                    if _run_blocks_queue(
+                        queued_record,
+                        ignore_job=queued_record.run_id == finished_run_id,
+                    ):
+                        return queued_run_id
+                    message_queue.complete(root_run_id, str(running["id"]))
+
+            pending = next(
+                (item for item in message_queue.active(root_run_id) if item.get("status") == "pending"),
+                None,
+            )
+            if pending is None:
+                return None
+            followup_id = uuid4().hex
+            try:
+                spec = _prepare_followup_spec(
+                    parent,
+                    str(pending.get("message") or ""),
+                    followup_id=followup_id,
+                )
+            except ValueError as exc:
+                message_queue.complete(root_run_id, str(pending["id"]), error=str(exc))
+                return None
+            claimed = message_queue.claim(root_run_id, str(pending["id"]), followup_id)
+            if claimed is None:
+                return None
+            try:
+                _submit_spec(
+                    spec,
+                    "queued_followup",
+                    queue_item_id=str(claimed["id"]),
+                )
+            except ValueError as exc:
+                message_queue.release(root_run_id, str(claimed["id"]), str(exc))
+                return None
+            return followup_id
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
@@ -250,6 +412,8 @@ def create_app(
 
     @app.get("/api/runs")
     def list_runs() -> list[dict[str, Any]]:
+        for root_run_id in message_queue.roots():
+            _dispatch_next_queued_message(root_run_id)
         return _conversation_summaries(store, manager)
 
     @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
@@ -291,7 +455,7 @@ def create_app(
             goal_mode=payload.goal_mode,
         )
         try:
-            manager.submit(spec.run_id, "run", lambda: runner_factory(settings).run(spec))
+            _submit_spec(spec, "run")
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"run_id": spec.run_id, "status": "queued"}
@@ -299,7 +463,11 @@ def create_app(
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
         record = _load_record(store, run_id)
-        return _run_detail(store, record, manager.status(run_id))
+        root_run_id = _root_run_id(record)
+        _dispatch_next_queued_message(root_run_id)
+        payload = _run_detail(store, record, manager.status(run_id))
+        payload["message_queue"] = redact_value(message_queue.active(root_run_id))
+        return payload
 
     @app.get("/api/runs/{run_id}/events")
     async def stream_events(
@@ -348,59 +516,30 @@ def create_app(
         selected = _load_record(store, run_id)
         conversation = _conversation_records(store, selected)
         parent = conversation[-1]
+        root = conversation[0]
         parent_job = manager.status(parent.run_id)
-        if parent.status in ACTIVE_STATUSES or (
+        active_queue = message_queue.active(root.run_id)
+        if parent.status in QUEUE_BLOCKING_STATUSES or (
             parent_job and parent_job.get("state") in {"queued", "running"}
-        ):
+        ) or active_queue:
             safe_message, credentials = sanitize_and_capture_credentials([payload.message])
-            root = conversation[0]
             CredentialVault(settings.state_dir).merge(root.run_id, credentials)
-            steering = ControlStore(store, parent.run_id).add_steering(safe_message[0])
-            EventLog(store, parent.run_id).emit("steering_received", steering)
+            item = message_queue.enqueue(root.run_id, safe_message[0])
+            EventLog(store, parent.run_id).emit("followup_queued", item)
+            if parent.status not in QUEUE_BLOCKING_STATUSES and not (
+                parent_job and parent_job.get("state") in {"queued", "running"}
+            ):
+                _dispatch_next_queued_message(root.run_id)
             return {
                 "run_id": parent.run_id,
                 "root_run_id": root.run_id,
                 "parent_run_id": _parent_run_id(parent),
-                "status": "steering_accepted",
+                "status": "followup_queued",
+                "queue_item": redact_value(item),
             }
-        workspace = Path(parent.workspace or "").expanduser().resolve()
-        if not workspace.is_dir():
-            raise HTTPException(status_code=409, detail="saved workspace is missing")
         try:
-            parent_spec = TaskSpec.model_validate(parent.metadata["task_spec"])
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=409, detail="saved task configuration is invalid") from exc
-
-        root = conversation[0]
-        sanitized, credentials = sanitize_and_capture_credentials(
-            [*[item.task for item in conversation], payload.message]
-        )
-        CredentialVault(settings.state_dir).merge(root.run_id, credentials)
-        for record, safe_task in zip(conversation, sanitized[:-1], strict=True):
-            if record.task == safe_task:
-                continue
-            record.task = safe_task
-            record.metadata = redact_value(record.metadata)
-            store.save(record)
-        followup_id = uuid4().hex
-        spec = TaskSpec(
-            run_id=followup_id,
-            repo=workspace,
-            task=sanitized[-1],
-            include_dirty=True,
-            language=parent_spec.language,
-            verification=parent_spec.verification,
-            max_repairs=parent_spec.max_repairs,
-            image=parent_spec.image,
-            source_mode=parent_spec.source_mode,
-            parent_run_id=parent.run_id,
-            root_run_id=root.run_id,
-            conversation_context=_build_conversation_context(store, conversation, settings),
-            runtime_mode=parent_spec.runtime_mode,
-            goal_mode=parent_spec.goal_mode,
-        )
-        try:
-            manager.submit(spec.run_id, "followup", lambda: runner_factory(settings).run(spec))
+            spec = _prepare_followup_spec(parent, payload.message, followup_id=uuid4().hex)
+            _submit_spec(spec, "followup")
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
@@ -408,6 +547,35 @@ def create_app(
             "root_run_id": root.run_id,
             "parent_run_id": parent.run_id,
             "status": "queued",
+        }
+
+    @app.post("/api/runs/{run_id}/queue/{item_id}/guide")
+    def guide_queued_message(run_id: str, item_id: str) -> dict[str, Any]:
+        selected = _load_record(store, run_id)
+        conversation = _conversation_records(store, selected)
+        current = conversation[-1]
+        current_job = manager.status(current.run_id)
+        if current.status not in ACTIVE_STATUSES and not (
+            current_job and current_job.get("state") in {"queued", "running"}
+        ):
+            raise HTTPException(status_code=409, detail="only an active run accepts guidance")
+        root_run_id = conversation[0].run_id
+        try:
+            item = message_queue.guide(root_run_id, item_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="queued message not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        steering = ControlStore(store, current.run_id).add_steering(str(item.get("message") or ""))
+        EventLog(store, current.run_id).emit(
+            "queued_followup_guided",
+            {"queue_item_id": item_id, "steering": steering},
+        )
+        return {
+            "run_id": current.run_id,
+            "root_run_id": root_run_id,
+            "status": "guidance_accepted",
+            "queue_item": redact_value(item),
         }
 
     @app.get("/api/runs/{run_id}/artifacts/{artifact}")

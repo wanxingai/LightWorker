@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from lightworker.analysis_tools import CredentialVault
 from lightworker.config import WorkerConfig
+from lightworker.control import ControlStore
 from lightworker.models import RunRecord, RunStatus, TaskSpec
 from lightworker.storage import RunStore
 from lightworker.web import create_app
@@ -50,6 +51,50 @@ class CapturingRunner:
 
     def decide_approval(self, run_id: str, step: str, decision: str, note: str) -> None:
         self.__class__.approvals.append((run_id, step, decision, note))
+
+
+class DeferredManager:
+    def __init__(self) -> None:
+        self.jobs: list[tuple[str, str, Any]] = []
+        self.states: dict[str, dict[str, Any]] = {}
+
+    def submit(self, run_id: str, action: str, function: Any) -> None:
+        self.jobs.append((run_id, action, function))
+        self.states[run_id] = {"state": "queued", "action": action, "error": None}
+
+    def status(self, run_id: str) -> dict[str, Any] | None:
+        return self.states.get(run_id)
+
+    def run_next(self) -> None:
+        run_id, action, function = next(
+            job for job in self.jobs if self.states[job[0]]["state"] == "queued"
+        )
+        self.states[run_id] = {"state": "running", "action": action, "error": None}
+        function()
+        self.states[run_id] = {"state": "completed", "action": action, "error": None}
+
+    def close(self) -> None:
+        return None
+
+
+class QueueCompletingRunner:
+    specs: list[TaskSpec] = []
+
+    def __init__(self, config: WorkerConfig) -> None:
+        self.store = RunStore(config.state_dir)
+
+    def run(self, spec: TaskSpec) -> RunRecord:
+        self.__class__.specs.append(spec)
+        record = RunRecord(
+            run_id=spec.run_id,
+            task=spec.task,
+            repo=str(spec.repo),
+            workspace=str(spec.repo),
+            status=RunStatus.SUCCEEDED,
+            metadata={"task_spec": spec.model_dump(mode="json")},
+        )
+        self.store.create(record)
+        return record
 
 
 def make_client(tmp_path: Path, manager: ImmediateManager | None = None) -> tuple[TestClient, WorkerConfig]:
@@ -168,6 +213,24 @@ def test_web_ui_exposes_message_actions_sidebar_collapse_and_citation_popover(tm
     assert ".message:hover .message-actions" in styles.text
     assert "body.sidebar-collapsed .app-shell" in styles.text
     assert ".citation-popover" in styles.text
+
+
+def test_web_ui_exposes_running_followup_queue_and_guidance_controls(tmp_path: Path):
+    client, _ = make_client(tmp_path)
+
+    page = client.get("/")
+    app = client.get("/static/app.js")
+    styles = client.get("/static/styles.css")
+
+    for element_id in ("messageQueuePanel", "messageQueueCount", "messageQueueList"):
+        assert f'id="{element_id}"' in page.text
+    assert "function renderMessageQueue" in app.text
+    assert "function guideQueuedMessage" in app.text
+    assert 'result.status === "followup_queued"' in app.text
+    assert 'busy && !hasInput' in app.text
+    assert 'textContent = "引导"' in app.text
+    assert ".message-queue-item" in styles.text
+    assert ".guide-button" in styles.text
 
 
 def test_run_detail_extracts_citations_from_tool_evidence(tmp_path: Path):
@@ -644,6 +707,97 @@ def test_followup_inherits_workspace_settings_and_conversation_context(
     assert followup.max_repairs == 1
     assert "分析这些市场资料" in followup.conversation_context
     assert "请补充库存和价格数据" in followup.conversation_context
+
+
+def test_active_followups_queue_and_pending_message_can_guide_current_run(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    manager = DeferredManager()
+    client, config = make_client(tmp_path, manager)
+    store = RunStore(config.state_dir)
+    root_spec = TaskSpec(run_id="queue-root", repo=git_repo, task="分析市场", source_mode="empty")
+    store.create(
+        RunRecord(
+            run_id="queue-root",
+            task=root_spec.task,
+            repo=str(git_repo),
+            workspace=str(git_repo),
+            status=RunStatus.RUNNING,
+            metadata={"task_spec": root_spec.model_dump(mode="json")},
+        )
+    )
+
+    first = client.post("/api/runs/queue-root/followups", json={"message": "先核实库存"})
+    second = client.post("/api/runs/queue-root/followups", json={"message": "再分析价格"})
+
+    assert first.status_code == 202
+    assert first.json()["status"] == "followup_queued"
+    assert second.json()["status"] == "followup_queued"
+    detail = client.get("/api/runs/queue-root").json()
+    assert [item["message"] for item in detail["message_queue"]] == ["先核实库存", "再分析价格"]
+    assert not manager.jobs
+
+    guided = client.post(
+        f"/api/runs/queue-root/queue/{first.json()['queue_item']['id']}/guide",
+        json={},
+    )
+
+    assert guided.status_code == 200
+    assert guided.json()["status"] == "guidance_accepted"
+    assert ControlStore(store, "queue-root").consume_steering() == ["先核实库存"]
+    remaining = client.get("/api/runs/queue-root").json()["message_queue"]
+    assert [item["message"] for item in remaining] == ["再分析价格"]
+
+
+def test_queued_followups_dispatch_sequentially_after_each_run_finishes(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    QueueCompletingRunner.specs.clear()
+    manager = DeferredManager()
+    config = WorkerConfig(
+        state_dir=tmp_path / "state",
+        model={
+            "model": "test-model",
+            "base_url": "http://model.invalid/v1",
+            "api_key": "test-api-secret",
+        },
+    )
+    app = create_app(config, task_manager=manager, runner_factory=QueueCompletingRunner)
+    client = TestClient(app)
+    store = RunStore(config.state_dir)
+    root_spec = TaskSpec(run_id="serial-root", repo=git_repo, task="执行主任务", source_mode="empty")
+    store.create(
+        RunRecord(
+            run_id="serial-root",
+            task=root_spec.task,
+            repo=str(git_repo),
+            workspace=str(git_repo),
+            status=RunStatus.RUNNING,
+            metadata={"task_spec": root_spec.model_dump(mode="json")},
+        )
+    )
+    client.post("/api/runs/serial-root/followups", json={"message": "排队任务 A"})
+    client.post("/api/runs/serial-root/followups", json={"message": "排队任务 B"})
+
+    store.update_status("serial-root", RunStatus.SUCCEEDED)
+    first_detail = client.get("/api/runs/serial-root").json()
+
+    assert [item["status"] for item in first_detail["message_queue"]] == ["running", "pending"]
+    assert [job[1] for job in manager.jobs] == ["queued_followup"]
+
+    manager.run_next()
+
+    root_detail = client.get("/api/runs/serial-root").json()
+    assert [item["status"] for item in root_detail["message_queue"]] == ["running"]
+    assert [spec.task for spec in QueueCompletingRunner.specs] == ["排队任务 A"]
+    assert [job[1] for job in manager.jobs] == ["queued_followup", "queued_followup"]
+
+    manager.run_next()
+
+    assert client.get("/api/runs/serial-root").json()["message_queue"] == []
+    assert [spec.task for spec in QueueCompletingRunner.specs] == ["排队任务 A", "排队任务 B"]
 
 
 def test_run_list_groups_followups_and_detail_returns_conversation(

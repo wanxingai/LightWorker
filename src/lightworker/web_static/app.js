@@ -338,6 +338,16 @@ function isBusy(run) {
   );
 }
 
+function queuedMessages(run) {
+  return Array.isArray(run?.message_queue)
+    ? run.message_queue.filter((item) => ["pending", "running"].includes(item.status))
+    : [];
+}
+
+function hasQueuedMessages(run) {
+  return queuedMessages(run).some((item) => item.run_id !== run?.run_id);
+}
+
 function nearBottom(element) {
   return element.scrollHeight - element.scrollTop - element.clientHeight < 160;
 }
@@ -418,6 +428,14 @@ async function loadRun(runId, { quiet = false } = {}) {
   try {
     const run = await api(`/api/runs/${encodeURIComponent(runId)}`);
     if (state.currentRunId !== runId) return;
+    const dispatched = queuedMessages(run).find(
+      (item) => item.status === "running" && item.run_id && item.run_id !== runId,
+    );
+    if (dispatched) {
+      state.currentRunId = dispatched.run_id;
+      await loadRun(dispatched.run_id, { quiet: true });
+      return;
+    }
     state.currentRun = run;
     await renderRun(run, { forceScroll: changed });
     connectEventStream(run);
@@ -485,6 +503,7 @@ async function renderRun(run, { forceScroll = false } = {}) {
   updateAssistantIntro(run);
   updateProcessPanel(run);
   updateApproval(run.approval_request);
+  renderMessageQueue(run);
   updateComposerMode(run);
 
   byId("summaryBlock").classList.add("is-hidden");
@@ -1137,6 +1156,8 @@ function showNewTask() {
   byId("cancelButton").classList.add("is-hidden");
   byId("resumeButton").classList.add("is-hidden");
   byId("rerunButton").classList.add("is-hidden");
+  byId("messageQueuePanel").classList.add("is-hidden");
+  byId("messageQueueList").replaceChildren();
   if (byId("approvalDialog").open) byId("approvalDialog").close();
   byId("taskInput").value = "";
   updateComposerMode(null);
@@ -1149,6 +1170,62 @@ function lines(value) {
   return value.split("\n").map((item) => item.trim()).filter(Boolean);
 }
 
+function renderMessageQueue(run) {
+  const panel = byId("messageQueuePanel");
+  const list = byId("messageQueueList");
+  const items = queuedMessages(run).filter(
+    (item) => !(item.status === "running" && item.run_id === run?.run_id),
+  );
+  list.replaceChildren();
+  panel.classList.toggle("is-hidden", !items.length);
+  byId("messageQueueCount").textContent = `${items.length} 条等待`;
+  items.forEach((item, index) => {
+    const row = document.createElement("article");
+    row.className = `message-queue-item status-${item.status}`;
+    const position = document.createElement("span");
+    position.className = "message-queue-position";
+    position.textContent = String(index + 1);
+    const content = document.createElement("div");
+    content.className = "message-queue-content";
+    const message = document.createElement("p");
+    message.textContent = item.message || "";
+    const meta = document.createElement("span");
+    meta.textContent = item.status === "running"
+      ? "正在开始下一轮"
+      : `等待执行 · ${formatTime(item.created_at, true)}`;
+    content.append(message, meta);
+    row.append(position, content);
+    if (item.status === "pending" && isBusy(run)) {
+      const guide = document.createElement("button");
+      guide.type = "button";
+      guide.className = "guide-button";
+      guide.textContent = "引导";
+      guide.setAttribute("aria-label", `立即用第 ${index + 1} 条消息引导当前任务`);
+      guide.addEventListener("click", () => guideQueuedMessage(item.id, guide));
+      row.append(guide);
+    }
+    list.append(row);
+  });
+}
+
+async function guideQueuedMessage(itemId, button) {
+  if (!state.currentRunId || !itemId) return;
+  button.disabled = true;
+  button.textContent = "发送中";
+  try {
+    await api(
+      `/api/runs/${encodeURIComponent(state.currentRunId)}/queue/${encodeURIComponent(itemId)}/guide`,
+      { method: "POST", body: "{}" },
+    );
+    showToast("已作为引导送入当前任务");
+    await loadRun(state.currentRunId, { quiet: true });
+  } catch (error) {
+    showToast(`引导失败：${error.message}`, true);
+    button.disabled = false;
+    button.textContent = "引导";
+  }
+}
+
 async function submitTask(event) {
   event.preventDefault();
   const task = byId("taskInput").value.trim();
@@ -1156,7 +1233,8 @@ async function submitTask(event) {
   const followup = Boolean(state.currentRunId);
   const button = byId("submitTaskButton");
   button.disabled = true;
-  button.textContent = followup ? "发送中" : "创建中";
+  const busyFollowup = followup && isBusy(state.currentRun);
+  button.textContent = busyFollowup ? "入队中" : followup ? "发送中" : "创建中";
   try {
     const sourceMode = document.querySelector('input[name="sourceMode"]:checked').value;
     const path = followup
@@ -1177,10 +1255,15 @@ async function submitTask(event) {
       method: "POST",
       body: JSON.stringify(body),
     });
-    state.currentRunId = result.run_id;
-    state.currentRun = null;
     byId("taskInput").value = "";
     autoGrowComposer();
+    if (result.status === "followup_queued") {
+      showToast("消息已挂起，将在当前任务结束后执行");
+      await loadRun(state.currentRunId, { quiet: true });
+      return;
+    }
+    state.currentRunId = result.run_id;
+    state.currentRun = null;
     byId("welcomeState").classList.add("is-hidden");
     byId("conversation").classList.remove("is-hidden");
     byId("userPrompt").textContent = task;
@@ -1198,9 +1281,11 @@ async function submitTask(event) {
 function updateComposerMode(run) {
   const continuing = Boolean(state.currentRunId);
   const busy = continuing && isBusy(run);
+  const hasInput = Boolean(byId("taskInput").value.trim());
   byId("composerOptions").classList.toggle("is-hidden", continuing);
   byId("composerContext").classList.toggle("is-hidden", !continuing);
-  byId("composerStopButton").classList.toggle("is-hidden", !busy);
+  byId("composerStopButton").classList.toggle("is-hidden", !busy || hasInput);
+  byId("submitTaskButton").classList.toggle("is-hidden", busy && !hasInput);
   byId("taskInput").placeholder = continuing
     ? "继续补充资料或追问，按 Enter 发送…"
     : "描述任意任务，按 Enter 提交…";
@@ -1208,7 +1293,7 @@ function updateComposerMode(run) {
   byId("submitTaskButton").disabled = false;
   if (continuing) {
     byId("composerNote").textContent = busy
-      ? "当前轮次执行中；发送内容会作为实时补充在下一个模型步骤生效"
+      ? "当前轮次执行中；发送内容会先挂起排队，也可在队列中点击“引导”立即影响当前规划"
       : "继续追问将沿用本对话上下文和上一轮隔离工作区";
   } else {
     updateSourceMode();
@@ -1276,7 +1361,7 @@ async function decideApproval(decision) {
 function schedulePoll(delay) {
   window.clearTimeout(state.pollTimer);
   if (!state.currentRunId) return;
-  const active = isBusy(state.currentRun);
+  const active = isBusy(state.currentRun) || hasQueuedMessages(state.currentRun);
   if (!active) return;
   state.pollTimer = window.setTimeout(
     () => loadRuns({ quiet: true }),
@@ -1302,7 +1387,10 @@ function bindEvents() {
   byId("newTaskButton").addEventListener("click", showNewTask);
   byId("refreshButton").addEventListener("click", () => loadRuns());
   byId("taskForm").addEventListener("submit", submitTask);
-  byId("taskInput").addEventListener("input", autoGrowComposer);
+  byId("taskInput").addEventListener("input", () => {
+    autoGrowComposer();
+    updateComposerMode(state.currentRun);
+  });
   byId("taskInput").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
