@@ -559,31 +559,83 @@ select:focus-visible {
   color: var(--muted-strong);
 }
 
+.process-panel {
+  margin-top: 1px;
+  border-bottom: 1px solid var(--line);
+}
+
+.process-panel > .process-summary {
+  width: fit-content;
+  min-height: 38px;
+  padding: 4px 1px 12px 0;
+  color: var(--muted);
+  cursor: pointer;
+  direction: rtl;
+  font-size: 13px;
+  list-style-position: outside;
+}
+
+.process-panel > .process-summary::marker {
+  color: var(--muted);
+  direction: ltr;
+  font-size: 0.82em;
+  unicode-bidi: isolate;
+}
+
+.process-summary-copy {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  direction: ltr;
+}
+
+.process-summary-copy strong {
+  color: var(--muted-strong);
+  font-weight: 680;
+}
+
+.process-panel.is-active .process-summary-copy strong {
+  color: var(--ink);
+}
+
+.process-panel.needs-attention .process-summary-copy strong {
+  color: var(--red);
+}
+
+.process-content {
+  padding: 10px 0 16px;
+}
+
 .activity-list {
   display: grid;
-  gap: 8px;
+  gap: 0;
 }
 
 .activity-step {
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: #fcfcfb;
+  overflow: visible;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
 }
 
 .activity-step[open] {
-  box-shadow: 0 6px 18px rgba(30, 32, 29, 0.045);
+  box-shadow: none;
 }
 
 .activity-step > summary {
   display: grid;
-  min-height: 43px;
+  min-height: 34px;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
-  padding: 9px 12px;
+  padding: 6px 4px;
   cursor: pointer;
   list-style: none;
+  border-radius: 7px;
+}
+
+.activity-step > summary:hover {
+  background: rgba(0, 0, 0, 0.035);
 }
 
 .activity-step > summary::-webkit-details-marker {
@@ -637,8 +689,8 @@ select:focus-visible {
 }
 
 .step-details {
-  padding: 0 12px 12px 29px;
-  border-top: 1px solid #ecece8;
+  padding: 0 4px 10px 21px;
+  border-top: 0;
 }
 
 .step-output {
@@ -657,29 +709,33 @@ select:focus-visible {
 
 .tool-list {
   display: grid;
-  gap: 6px;
-  margin-top: 10px;
+  gap: 2px;
+  margin-top: 3px;
 }
 
 .tool-event {
   overflow: hidden;
-  border: 1px solid #e5e5e1;
-  border-radius: 8px;
-  background: white;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
 }
 
 .tool-event summary {
   display: flex;
-  min-height: 34px;
+  min-height: 30px;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 7px 9px;
+  padding: 5px 8px;
   cursor: pointer;
   color: #444741;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 10px;
   list-style: none;
+}
+
+.tool-event summary:hover {
+  background: rgba(0, 0, 0, 0.035);
 }
 
 .tool-event summary::-webkit-details-marker {
@@ -691,7 +747,7 @@ select:focus-visible {
   overflow: auto;
   margin: 0;
   padding: 9px;
-  border-top: 1px solid #ecece8;
+  border-top: 0;
   background: #f8f8f6;
   color: #454842;
   font-size: 10px;
@@ -740,6 +796,45 @@ select:focus-visible {
   overflow: hidden;
   border: 1px solid var(--line);
   background: white;
+}
+
+.answer-block.final-answer {
+  position: relative;
+  overflow: visible;
+  margin-top: 0;
+  border: 0;
+  background: transparent;
+}
+
+.final-answer .final-answer-toolbar {
+  position: absolute;
+  z-index: 1;
+  top: 8px;
+  right: 0;
+  min-height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.final-answer:hover .final-answer-toolbar,
+.final-answer:focus-within .final-answer-toolbar {
+  opacity: 1;
+}
+
+.final-answer .final-answer-toolbar strong {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+.final-answer > .markdown-text {
+  padding: 22px 0 0;
 }
 
 .answer-heading {

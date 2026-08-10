@@ -6,9 +6,9 @@
     <meta name="color-scheme" content="light" />
     <title>LightWorker</title>
     <meta name="description" content="以聊天方式提交并观察通用任务。" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260811-2" />
-    <script src="/static/markdown.js?v=20260811-2" defer></script>
-    <script src="/static/app.js?v=20260811-2" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260811-3" />
+    <script src="/static/markdown.js?v=20260811-3" defer></script>
+    <script src="/static/app.js?v=20260811-3" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -88,32 +88,43 @@
               <div class="message-avatar assistant-avatar">L</div>
               <div class="message-body">
                 <div class="message-label">LightWorker</div>
-                <div class="assistant-intro" id="assistantIntro">正在准备隔离工作区…</div>
-                <div class="runtime-inspector is-hidden" id="runtimeInspector">
-                  <details id="goalPanel">
-                    <summary>Goal 与预算</summary>
-                    <pre id="goalContent"></pre>
-                  </details>
-                  <details id="agentPanel">
-                    <summary>Agent 树</summary>
-                    <div id="agentTreeContent"></div>
-                  </details>
-                  <details id="browserPanel">
-                    <summary>浏览器截图</summary>
-                    <div class="browser-gallery" id="browserGallery"></div>
-                  </details>
-                  <details id="resourcesPanel">
-                    <summary>Memory · Skills · RAG · MCP</summary>
-                    <div class="resource-manager" id="resourcesContent">
-                      <button class="text-button" id="loadResourcesButton" type="button">加载资源</button>
+                <details class="process-panel" id="processPanel" open>
+                  <summary class="process-summary">
+                    <span class="process-summary-copy">
+                      <strong id="processLabel">处理中</strong>
+                      <span id="processDuration">0s</span>
+                    </span>
+                  </summary>
+                  <div class="process-content">
+                    <div class="assistant-intro" id="assistantIntro">正在准备隔离工作区…</div>
+                    <div class="runtime-inspector is-hidden" id="runtimeInspector">
+                      <details id="goalPanel">
+                        <summary>Goal 与预算</summary>
+                        <pre id="goalContent"></pre>
+                      </details>
+                      <details id="agentPanel">
+                        <summary>Agent 树</summary>
+                        <div id="agentTreeContent"></div>
+                      </details>
+                      <details id="browserPanel">
+                        <summary>浏览器截图</summary>
+                        <div class="browser-gallery" id="browserGallery"></div>
+                      </details>
+                      <details id="resourcesPanel">
+                        <summary>Memory · Skills · RAG · MCP</summary>
+                        <div class="resource-manager" id="resourcesContent">
+                          <button class="text-button" id="loadResourcesButton" type="button">加载资源</button>
+                        </div>
+                      </details>
                     </div>
-                  </details>
-                </div>
-                <div class="activity-list" id="activityList"></div>
-                <div class="verification-card is-hidden" id="verificationCard"></div>
-                <section class="answer-block is-hidden" id="summaryBlock">
-                  <div class="answer-heading">
-                    <strong>任务总结</strong>
+                    <div class="activity-list" id="activityList"></div>
+                    <div class="verification-card is-hidden" id="verificationCard"></div>
+                    <div class="run-error is-hidden" id="runError"></div>
+                  </div>
+                </details>
+                <section class="answer-block final-answer is-hidden" id="summaryBlock">
+                  <div class="answer-heading final-answer-toolbar">
+                    <strong>最终输出</strong>
                     <button class="text-button" type="button" data-copy-target="summaryContent">复制</button>
                   </div>
                   <div class="markdown-text" id="summaryContent"></div>
@@ -128,7 +139,6 @@
                   </div>
                   <pre id="diffContent"></pre>
                 </section>
-                <div class="run-error is-hidden" id="runError"></div>
               </div>
             </article>
           </div>

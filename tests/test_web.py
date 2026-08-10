@@ -105,6 +105,23 @@ def test_web_ui_bundles_safe_markdown_renderer(tmp_path: Path):
     assert 'summaryContent").textContent = content.trim()' not in app.text
 
 
+def test_web_ui_collapses_completed_process_before_final_output(tmp_path: Path):
+    client, _ = make_client(tmp_path)
+
+    page = client.get("/")
+    app = client.get("/static/app.js")
+
+    assert page.status_code == 200
+    assert app.status_code == 200
+    assert 'id="processPanel"' in page.text
+    assert 'id="processDuration"' in page.text
+    assert page.text.index('id="processPanel"') < page.text.index('id="summaryBlock"')
+    assert "function elapsedDuration" in app.text
+    assert 'label = "已处理"' in app.text
+    assert "panel.open = !successful" in app.text
+    assert 'activeProcess && step.status === "pending"' in app.text
+
+
 def test_create_run_validates_repo_and_commands(git_repo: Path, tmp_path: Path):
     CapturingRunner.specs.clear()
     manager = ImmediateManager()

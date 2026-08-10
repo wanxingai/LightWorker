@@ -42,6 +42,7 @@ const state = {
   eventSource: null,
   eventRefreshTimer: null,
   resourcesRunId: null,
+  elapsedTimer: null,
 };
 
 const byId = (id) => document.getElementById(id);
@@ -109,6 +110,25 @@ function duration(value) {
   if (!value || Number.isNaN(Number(value))) return "";
   const milliseconds = Number(value);
   return milliseconds < 1000 ? `${Math.round(milliseconds)}ms` : `${(milliseconds / 1000).toFixed(1)}s`;
+}
+
+function elapsedDuration(value) {
+  const totalSeconds = Math.max(0, Math.round(Number(value || 0) / 1000));
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  if (hours) return `${hours}h ${minutes}m ${seconds}s`;
+  if (totalMinutes) return `${totalMinutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function runElapsedMilliseconds(run, now = Date.now()) {
+  const startedAt = Date.parse(run?.created_at || "");
+  if (Number.isNaN(startedAt)) return 0;
+  const active = isBusy(run) || Boolean(run?.approval_request);
+  const endedAt = active ? now : Date.parse(run?.updated_at || "");
+  return Math.max(0, (Number.isNaN(endedAt) ? now : endedAt) - startedAt);
 }
 
 function statusLabel(value) {
@@ -264,6 +284,7 @@ async function renderRun(run, { forceScroll = false } = {}) {
   renderVerification(isBusy(run) ? [] : (run.verification || []));
   renderError(run);
   updateAssistantIntro(run);
+  updateProcessPanel(run);
   updateApproval(run.approval_request);
   updateComposerMode(run);
 
@@ -542,6 +563,36 @@ function updateAssistantIntro(run) {
   byId("assistantIntro").textContent = message;
 }
 
+function updateProcessPanel(run) {
+  const panel = byId("processPanel");
+  const successful = run.status === "succeeded" && !isBusy(run) && !run.approval_request;
+  const waiting = Boolean(run.approval_request);
+  panel.classList.toggle("is-complete", successful);
+  panel.classList.toggle("is-active", isBusy(run));
+  panel.classList.toggle("needs-attention", !successful && !isBusy(run));
+  panel.open = !successful;
+
+  let label = "处理中";
+  if (successful) label = "已处理";
+  else if (waiting) label = "等待确认";
+  else if (run.status === "paused") label = "已暂停";
+  else if (["failed", "needs_attention", "interrupted", "budget_limited", "cancelled"].includes(run.status)) {
+    label = "处理未完成";
+  }
+  byId("processLabel").textContent = label;
+
+  const updateElapsed = () => {
+    if (state.currentRunId !== run.run_id) return;
+    byId("processDuration").textContent = elapsedDuration(runElapsedMilliseconds(run));
+  };
+  updateElapsed();
+  window.clearInterval(state.elapsedTimer);
+  state.elapsedTimer = null;
+  if (isBusy(run) || waiting) {
+    state.elapsedTimer = window.setInterval(updateElapsed, 1000);
+  }
+}
+
 function renderActions(run) {
   const busy = isBusy(run);
   const hasApproval = Boolean(run.approval_request);
@@ -561,13 +612,15 @@ function renderActions(run) {
 function renderActivity(activity, run) {
   const list = byId("activityList");
   list.replaceChildren();
-  const terminal = !isBusy(run) && !run.approval_request;
+  const activeProcess = isBusy(run) || Boolean(run.approval_request);
+  const terminal = !activeProcess;
   const visible = activity.filter((step) => {
+    if (activeProcess && step.status === "pending") return false;
     if (terminal && step.status === "pending") return false;
     return !(step.status === "skipped" && String(step.error || "").includes("cancelled before execution"));
   });
 
-  if (!visible.length && isBusy(run)) {
+  if (!visible.length && activeProcess) {
     const pending = document.createElement("details");
     pending.className = "activity-step status-running";
     pending.open = true;
@@ -642,7 +695,7 @@ function renderActivity(activity, run) {
     details.append(content);
     list.append(details);
 
-    if (index === visible.length - 1 && step.status === "success" && isBusy(run)) details.open = true;
+    if (index === visible.length - 1 && step.status === "success" && activeProcess) details.open = true;
   });
 }
 
@@ -789,6 +842,8 @@ function showNewTask() {
   state.renderToken += 1;
   state.approvalRequestId = null;
   window.clearTimeout(state.pollTimer);
+  window.clearInterval(state.elapsedTimer);
+  state.elapsedTimer = null;
   if (state.eventSource) state.eventSource.close();
   state.eventSource = null;
   renderRunList();
