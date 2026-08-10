@@ -141,6 +141,99 @@ def test_web_ui_exposes_stream_activity_and_composer_runtime_controls(tmp_path: 
     assert ".composer-model" in styles.text
 
 
+def test_web_ui_exposes_message_actions_sidebar_collapse_and_citation_popover(tmp_path: Path):
+    client, _ = make_client(tmp_path)
+
+    page = client.get("/")
+    app = client.get("/static/app.js")
+    renderer = client.get("/static/markdown.js")
+    styles = client.get("/static/styles.css")
+
+    assert page.status_code == 200
+    for element_id in (
+        "sidebarCollapseButton",
+        "sidebarExpandButton",
+        "currentUserActions",
+        "currentAssistantActions",
+        "citationPopover",
+        "citationLink",
+    ):
+        assert f'id="{element_id}"' in page.text
+    assert "function mountMessageActions" in app.text
+    assert "function enhanceCitations" in app.text
+    assert "function setSidebarCollapsed" in app.text
+    assert 'textContent = "投诉"' in app.text
+    assert 'textContent = "点赞"' in app.text
+    assert "https?:\\/\\/" in renderer.text
+    assert ".message:hover .message-actions" in styles.text
+    assert "body.sidebar-collapsed .app-shell" in styles.text
+    assert ".citation-popover" in styles.text
+
+
+def test_run_detail_extracts_citations_from_tool_evidence(tmp_path: Path):
+    client, config = make_client(tmp_path)
+    store = RunStore(config.state_dir)
+    store.create(
+        RunRecord(
+            run_id="citation-run",
+            task="分析外部资料",
+            repo="/repo",
+            workspace="/workspace",
+            status=RunStatus.SUCCEEDED,
+        )
+    )
+    store.write_text(
+        "citation-run",
+        "summary.md",
+        "该工具支持现代 Python 项目管理。[来源](https://example.com/uv-guide)",
+    )
+    store.write_json(
+        "citation-run",
+        "flow/citation-run.json",
+        {
+            "steps": [
+                {
+                    "name": "analysis",
+                    "status": "success",
+                    "trace": [
+                        {
+                            "type": "tool_result",
+                            "timestamp": "2026-08-11T02:30:00+00:00",
+                            "data": {
+                                "name": "web_search",
+                                "output": json.dumps(
+                                    {
+                                        "ok": True,
+                                        "results": [
+                                            {
+                                                "title": "uv：现代化的 Python 包和项目管理工具",
+                                                "url": "https://example.com/uv-guide",
+                                                "snippet": "2026-08-10 发布。介绍 uv run 和虚拟环境管理。",
+                                            }
+                                        ],
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    detail = client.get("/api/runs/citation-run")
+
+    assert detail.status_code == 200
+    citations = detail.json()["citations"]
+    assert citations == detail.json()["conversation"][0]["citations"]
+    assert citations[0]["id"] == 1
+    assert citations[0]["url"] == "https://example.com/uv-guide"
+    assert citations[0]["site"] == "example.com"
+    assert citations[0]["published_at"] == "2026-08-10"
+    assert "uv run" in citations[0]["excerpt"]
+
+
 def test_create_run_validates_repo_and_commands(git_repo: Path, tmp_path: Path):
     CapturingRunner.specs.clear()
     manager = ImmediateManager()

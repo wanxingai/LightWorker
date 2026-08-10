@@ -47,15 +47,204 @@ const state = {
 
 const byId = (id) => document.getElementById(id);
 
-function setMarkdownContent(element, markdown) {
+function setMarkdownContent(element, markdown, citations = []) {
   if (!element) return;
   const source = String(markdown || "");
   if (window.LightWorkerMarkdown?.setContent) {
     window.LightWorkerMarkdown.setContent(element, source);
+    enhanceCitations(element, citations);
     return;
   }
   element.dataset.rawMarkdown = source;
   element.textContent = source;
+}
+
+function canonicalSourceUrl(value) {
+  try {
+    const url = new URL(String(value || ""), window.location.href);
+    if (!/^https?:$/.test(url.protocol)) return "";
+    url.hash = "";
+    return url.href;
+  } catch (_) {
+    return "";
+  }
+}
+
+function citationButton(citation) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "citation-badge";
+  button.textContent = `来源 ${citation.id}`;
+  button.setAttribute("aria-label", `查看引用来源 ${citation.id}：${citation.title || citation.site || citation.url}`);
+  button.setAttribute("aria-expanded", "false");
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    showCitationPopover(button, citation);
+  });
+  return button;
+}
+
+function enhanceCitations(element, citations) {
+  const values = Array.isArray(citations) ? citations : [];
+  const byUrl = new Map(values.map((item) => [canonicalSourceUrl(item.url), item]).filter(([url]) => url));
+  const used = new Set();
+  const anchors = [...element.querySelectorAll('a[href^="http://"], a[href^="https://"]')];
+  anchors.forEach((anchor) => {
+    const url = canonicalSourceUrl(anchor.href);
+    let citation = byUrl.get(url);
+    if (!citation) {
+      citation = {
+        id: values.length + used.size + 1,
+        url: anchor.href,
+        title: anchor.textContent.trim() || new URL(anchor.href).hostname,
+        site: new URL(anchor.href).hostname.replace(/^www\./, ""),
+        excerpt: "该来源由回答中的链接提供。",
+      };
+    }
+    anchor.classList.add("citation-source-link");
+    anchor.after(citationButton(citation));
+    used.add(citation.id);
+  });
+
+  const unmatched = values.filter((item) => !used.has(item.id));
+  if (!anchors.length && unmatched.length) {
+    const target = element.querySelector("p:last-of-type, li:last-of-type") || element.lastElementChild || element;
+    const tail = document.createElement("span");
+    tail.className = "citation-tail";
+    unmatched.forEach((item) => tail.append(citationButton(item)));
+    target.append(" ", tail);
+  }
+}
+
+function showCitationPopover(button, citation) {
+  document.querySelectorAll(".citation-badge[aria-expanded='true']").forEach((item) => {
+    if (item !== button) item.setAttribute("aria-expanded", "false");
+  });
+  button.setAttribute("aria-expanded", "true");
+  const popover = byId("citationPopover");
+  const sourceDate = citation.published_at
+    ? citation.published_at
+    : citation.observed_at
+      ? `访问于 ${formatTime(citation.observed_at, true)}`
+      : "";
+  byId("citationMeta").textContent = [citation.site || "引用来源", sourceDate].filter(Boolean).join(" · ");
+  byId("citationTitle").textContent = citation.title || citation.site || "引用文档";
+  byId("citationExcerpt").textContent = citation.excerpt || "该来源没有可展示的内容摘要，请打开原文查看。";
+  byId("citationLink").href = citation.url;
+  popover.classList.remove("is-hidden");
+  window.requestAnimationFrame(() => {
+    const trigger = button.getBoundingClientRect();
+    const width = popover.offsetWidth;
+    const height = popover.offsetHeight;
+    const left = Math.max(12, Math.min(trigger.left, window.innerWidth - width - 12));
+    const below = trigger.bottom + 8;
+    const top = below + height <= window.innerHeight - 12 ? below : Math.max(12, trigger.top - height - 8);
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+  });
+}
+
+function closeCitationPopover() {
+  byId("citationPopover").classList.add("is-hidden");
+  document.querySelectorAll(".citation-badge[aria-expanded='true']").forEach((item) => {
+    item.setAttribute("aria-expanded", "false");
+  });
+}
+
+function feedbackStorageKey(runId, role) {
+  return `lightworker.feedback.${runId}.${role}`;
+}
+
+function savedFeedback(runId, role) {
+  try {
+    return window.localStorage.getItem(feedbackStorageKey(runId, role)) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function saveFeedback(runId, role, value) {
+  try {
+    if (value) window.localStorage.setItem(feedbackStorageKey(runId, role), value);
+    else window.localStorage.removeItem(feedbackStorageKey(runId, role));
+  } catch (_) {
+    // Feedback remains active for the current render when storage is unavailable.
+  }
+}
+
+function mountMessageActions(container, { text, createdAt, runId, role }) {
+  container.replaceChildren();
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "message-action-button";
+  copy.textContent = "复制";
+  copy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(String(text || ""));
+      showToast("已复制");
+    } catch (_) {
+      showToast("浏览器未允许复制", true);
+    }
+  });
+
+  const like = document.createElement("button");
+  like.type = "button";
+  like.className = "message-action-button";
+  like.textContent = "点赞";
+  const complaint = document.createElement("button");
+  complaint.type = "button";
+  complaint.className = "message-action-button";
+  complaint.textContent = "投诉";
+  let selected = savedFeedback(runId, role);
+  const refresh = () => {
+    like.classList.toggle("is-active", selected === "like");
+    complaint.classList.toggle("is-active", selected === "complaint");
+    like.setAttribute("aria-pressed", String(selected === "like"));
+    complaint.setAttribute("aria-pressed", String(selected === "complaint"));
+  };
+  like.addEventListener("click", () => {
+    selected = selected === "like" ? "" : "like";
+    saveFeedback(runId, role, selected);
+    refresh();
+    showToast(selected ? "已记录点赞" : "已取消点赞");
+  });
+  complaint.addEventListener("click", () => {
+    selected = selected === "complaint" ? "" : "complaint";
+    saveFeedback(runId, role, selected);
+    refresh();
+    showToast(selected ? "已记录投诉" : "已取消投诉");
+  });
+  refresh();
+
+  const time = document.createElement("time");
+  time.className = "message-created-at";
+  time.dateTime = createdAt || "";
+  time.textContent = formatTime(createdAt, true);
+  container.append(copy, like, complaint, time);
+  container.classList.remove("is-hidden");
+}
+
+function setSidebarCollapsed(collapsed, { persist = true } = {}) {
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+  byId("sidebarCollapseButton").setAttribute("aria-expanded", String(!collapsed));
+  byId("sidebarExpandButton").setAttribute("aria-expanded", String(!collapsed));
+  if (!persist) return;
+  try {
+    window.localStorage.setItem("lightworker.sidebarCollapsed", collapsed ? "1" : "0");
+  } catch (_) {
+    // Keep the current state when storage is unavailable.
+  }
+}
+
+function restoreSidebarState() {
+  let collapsed = false;
+  try {
+    collapsed = window.localStorage.getItem("lightworker.sidebarCollapsed") === "1";
+  } catch (_) {
+    collapsed = false;
+  }
+  setSidebarCollapsed(collapsed, { persist: false });
 }
 
 function clearMarkdownContent(element) {
@@ -274,6 +463,14 @@ async function renderRun(run, { forceScroll = false } = {}) {
   renderConversationHistory(turns, run.run_id);
   byId("userPrompt").textContent = run.task;
   byId("userPromptMeta").textContent = `${formatTime(run.created_at, true)} · ${run.source_mode === "empty" ? "空目录" : "已有仓库"}`;
+  mountMessageActions(byId("currentUserActions"), {
+    text: run.task,
+    createdAt: run.created_at,
+    runId: run.run_id,
+    role: "user",
+  });
+  byId("currentAssistantActions").replaceChildren();
+  byId("currentAssistantActions").classList.add("is-hidden");
 
   const runStatus = byId("runStatus");
   runStatus.className = `run-status status-${run.status}`;
@@ -509,7 +706,7 @@ function renderConversationHistory(turns, currentRunId) {
       heading.append(title);
       const content = document.createElement("div");
       content.className = "markdown-text";
-      setMarkdownContent(content, turn.summary.trim());
+      setMarkdownContent(content, turn.summary.trim(), turn.citations || []);
       block.append(heading, content);
       assistantBody.append(block);
     } else if (turn.error) {
@@ -528,7 +725,28 @@ function renderConversationHistory(turns, currentRunId) {
       diff.append(summary, content);
       assistantBody.append(diff);
     }
+    const assistantText = turn.summary?.trim() || turn.error || "";
+    if (assistantText) {
+      const actions = document.createElement("div");
+      actions.className = "message-actions";
+      mountMessageActions(actions, {
+        text: assistantText,
+        createdAt: turn.updated_at,
+        runId: turn.run_id,
+        role: "assistant",
+      });
+      assistantBody.append(actions);
+    }
     assistant.append(assistantAvatar, assistantBody);
+    const userActions = document.createElement("div");
+    userActions.className = "message-actions";
+    mountMessageActions(userActions, {
+      text: turn.message,
+      createdAt: turn.created_at,
+      runId: turn.run_id,
+      role: "user",
+    });
+    userBody.append(userActions);
     history.append(user, assistant);
   });
 }
@@ -855,8 +1073,14 @@ async function loadSummary(runId, renderToken) {
   try {
     const content = await api(`/api/runs/${encodeURIComponent(runId)}/artifacts/summary`);
     if (state.currentRunId !== runId || state.renderToken !== renderToken) return;
-    setMarkdownContent(byId("summaryContent"), content.trim());
+    setMarkdownContent(byId("summaryContent"), content.trim(), state.currentRun?.citations || []);
     byId("summaryBlock").classList.remove("is-hidden");
+    mountMessageActions(byId("currentAssistantActions"), {
+      text: content.trim(),
+      createdAt: state.currentRun?.updated_at,
+      runId,
+      role: "assistant",
+    });
   } catch (error) {
     showToast(`加载任务总结失败：${error.message}`, true);
   }
@@ -1097,7 +1321,10 @@ function bindEvents() {
   byId("rejectApprovalButton").addEventListener("click", () => decideApproval("rejected"));
   byId("sidebarOpenButton").addEventListener("click", () => document.body.classList.add("sidebar-open"));
   byId("sidebarCloseButton").addEventListener("click", () => document.body.classList.remove("sidebar-open"));
+  byId("sidebarCollapseButton").addEventListener("click", () => setSidebarCollapsed(true));
+  byId("sidebarExpandButton").addEventListener("click", () => setSidebarCollapsed(false));
   byId("sidebarScrim").addEventListener("click", () => document.body.classList.remove("sidebar-open"));
+  byId("citationCloseButton").addEventListener("click", closeCitationPopover);
   document.querySelectorAll("[data-prompt]").forEach((button) => {
     button.addEventListener("click", () => {
       byId("taskInput").value = button.dataset.prompt;
@@ -1118,14 +1345,22 @@ function bindEvents() {
     });
   });
   document.addEventListener("click", (event) => {
+    if (!byId("citationPopover").contains(event.target) && !event.target.closest?.(".citation-badge")) {
+      closeCitationPopover();
+    }
     if (!byId("sourceMenu").contains(event.target) && !byId("sourceButton").contains(event.target)) {
       byId("sourceMenu").classList.add("is-hidden");
       byId("sourceButton").setAttribute("aria-expanded", "false");
     }
   });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeCitationPopover();
+  });
+  byId("chatScroll").addEventListener("scroll", closeCitationPopover, { passive: true });
 }
 
 bindEvents();
+restoreSidebarState();
 updateSourceMode();
 autoGrowComposer();
 loadHealth();

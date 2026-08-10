@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import threading
@@ -54,6 +55,8 @@ ARTIFACTS = {
 }
 ACTIVE_STATUSES = {RunStatus.CREATED, RunStatus.PREPARING, RunStatus.RUNNING}
 SAFE_LOG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.log$")
+SOURCE_URL = re.compile(r"https?://[^\s<>\[\]{}\"']+", re.IGNORECASE)
+SOURCE_TOOL_MARKERS = ("web_search", "http_", "browser_", "rag_search", "rag_read")
 
 
 class RunCreateRequest(BaseModel):
@@ -798,7 +801,8 @@ def _run_detail(store: RunStore, record: RunRecord, job: dict[str, Any] | None) 
     payload["job"] = job
     payload["steps"] = _load_steps(flow_record) or _agentic_steps(events, record)
     payload["current_step"] = _current_step(payload["steps"], record.current_step, job)
-    payload["activity"] = _load_activity(flow_record) or _agentic_activity(events, record)
+    activity = _load_activity(flow_record) or _agentic_activity(events, record)
+    payload["activity"] = activity
     payload["events"] = events
     payload["artifacts"] = {
         name: (has_changes if name == "diff" else store.artifact_path(record.run_id, filename).is_file())
@@ -820,6 +824,10 @@ def _run_detail(store: RunStore, record: RunRecord, job: dict[str, Any] | None) 
     payload["parent_run_id"] = _parent_run_id(record)
     payload["conversation_title"] = redact_value(conversation[0].task)
     payload["conversation"] = [_conversation_turn(store, item) for item in conversation]
+    payload["citations"] = _extract_citations(
+        activity,
+        _read_optional_text(store, record.run_id, "summary.md"),
+    )
     plan = _read_optional_json(store, record.run_id, "plan.json")
     task_type = str(plan.get("task_type") or "") if isinstance(plan, dict) else ""
     payload["task_type"] = task_type
@@ -845,6 +853,10 @@ def _run_detail(store: RunStore, record: RunRecord, job: dict[str, Any] | None) 
 
 
 def _conversation_turn(store: RunStore, record: RunRecord) -> dict[str, Any]:
+    summary = _read_optional_text(store, record.run_id, "summary.md")
+    flow_record = _load_flow_record(store, record.run_id)
+    events = EventLog(store, record.run_id).read(limit=500)
+    activity = _load_activity(flow_record) or _agentic_activity(events, record)
     return redact_value(
         {
             "run_id": record.run_id,
@@ -854,10 +866,190 @@ def _conversation_turn(store: RunStore, record: RunRecord) -> dict[str, Any]:
             "updated_at": record.updated_at.isoformat(),
             "error": record.error,
             "source_mode": _source_mode(record),
-            "summary": _read_optional_text(store, record.run_id, "summary.md"),
+            "summary": summary,
             "diff": _read_optional_text(store, record.run_id, "changes.patch"),
+            "citations": _extract_citations(activity, summary),
         }
     )
+
+
+def _extract_citations(activity: list[dict[str, Any]], summary: str | None) -> list[dict[str, Any]]:
+    sources: dict[str, dict[str, Any]] = {}
+
+    def add_source(
+        raw_url: Any,
+        *,
+        title: Any = "",
+        excerpt: Any = "",
+        observed_at: Any = None,
+        priority: int = 1,
+    ) -> None:
+        url = _safe_source_url(raw_url)
+        if not url:
+            return
+        parsed = urllib.parse.urlsplit(url)
+        cleaned_excerpt = _clean_document_text(excerpt)
+        date_material = cleaned_excerpt
+        cleaned_title = _clean_document_text(title, limit=180)
+        if not cleaned_title and cleaned_excerpt:
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", str(excerpt), re.IGNORECASE | re.DOTALL)
+            if title_match:
+                cleaned_title = _clean_document_text(title_match.group(1), limit=180)
+            else:
+                title_match = re.search(
+                    r"(?:^|\s)Title:\s*(.*?)(?:\s+(?:Description|Visible text|Content):|$)",
+                    cleaned_excerpt,
+                    re.IGNORECASE,
+                )
+                if title_match:
+                    cleaned_title = _clean_document_text(title_match.group(1), limit=180)
+        if re.match(r"^Title:\s*", cleaned_excerpt, re.IGNORECASE):
+            excerpt_match = re.search(
+                r"(?:^|\s)(?:Description|Visible text|Content):\s*(.*?)"
+                r"(?=\s+(?:Visible text|Content):|$)",
+                cleaned_excerpt,
+                re.IGNORECASE,
+            )
+            if excerpt_match:
+                cleaned_excerpt = _clean_document_text(excerpt_match.group(1))
+        source = {
+            "url": url,
+            "title": cleaned_title or parsed.netloc.removeprefix("www."),
+            "site": parsed.netloc.removeprefix("www."),
+            "excerpt": cleaned_excerpt,
+            "published_at": _source_date(f"{cleaned_title} {date_material}"),
+            "observed_at": str(observed_at or ""),
+            "_priority": priority,
+        }
+        current = sources.get(url)
+        if current is None:
+            sources[url] = source
+            return
+        if len(source["title"]) > len(current["title"]):
+            current["title"] = source["title"]
+        if len(source["excerpt"]) > len(current["excerpt"]):
+            current["excerpt"] = source["excerpt"]
+        current["published_at"] = current["published_at"] or source["published_at"]
+        current["observed_at"] = current["observed_at"] or source["observed_at"]
+        current["_priority"] = min(current["_priority"], source["_priority"])
+
+    for step in activity:
+        for tool in step.get("tools") or []:
+            name = str(tool.get("name") or "").lower()
+            if not any(marker in name for marker in SOURCE_TOOL_MARKERS):
+                continue
+            raw_output = str(tool.get("output") or "")
+            try:
+                payload = json.loads(raw_output)
+            except json.JSONDecodeError:
+                payload = None
+            direct_source = any(
+                marker in name
+                for marker in ("http_get", "http_request", "browser_extract", "rag_read")
+            )
+            priority = 0 if direct_source else 1
+            candidates: list[dict[str, str]] = []
+            if payload is not None:
+                candidates = _citation_candidates(payload)
+                for candidate in candidates:
+                    add_source(
+                        candidate.get("url"),
+                        title=candidate.get("title"),
+                        excerpt=candidate.get("excerpt"),
+                        observed_at=tool.get("timestamp"),
+                        priority=priority,
+                    )
+            if not candidates:
+                fallback_excerpt = _clean_document_text(raw_output)
+                for match in SOURCE_URL.findall(raw_output):
+                    add_source(
+                        match,
+                        excerpt=fallback_excerpt,
+                        observed_at=tool.get("timestamp"),
+                        priority=priority,
+                    )
+
+    summary_text = str(summary or "")
+    for match in SOURCE_URL.findall(summary_text):
+        url = _safe_source_url(match)
+        if url and url not in sources:
+            add_source(url, excerpt=_summary_source_excerpt(summary_text, match), priority=0)
+
+    return [
+        {"id": index, **{key: value for key, value in source.items() if key != "_priority"}}
+        for index, source in enumerate(
+            sorted(sources.values(), key=lambda item: item["_priority"])[:8],
+            start=1,
+        )
+    ]
+
+
+def _citation_candidates(value: Any) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    if isinstance(value, list):
+        for item in value:
+            candidates.extend(_citation_candidates(item))
+        return candidates
+    if not isinstance(value, dict):
+        return candidates
+    raw_url = next(
+        (value.get(key) for key in ("url", "source_url", "page_url", "link") if value.get(key)),
+        None,
+    )
+    if raw_url:
+        title = next(
+            (value.get(key) for key in ("title", "name", "heading", "path") if value.get(key)),
+            "",
+        )
+        excerpt = next(
+            (
+                value.get(key)
+                for key in ("snippet", "excerpt", "description", "content", "text", "body")
+                if value.get(key)
+            ),
+            "",
+        )
+        candidates.append({"url": str(raw_url), "title": str(title), "excerpt": str(excerpt)})
+    for key in ("results", "sources", "documents", "citations", "items"):
+        if key in value:
+            candidates.extend(_citation_candidates(value[key]))
+    return candidates
+
+
+def _safe_source_url(value: Any) -> str:
+    raw = str(value or "").strip().rstrip(".,;:!?)]}，。；：！？）】")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urllib.parse.urlunsplit(parsed)
+
+
+def _clean_document_text(value: Any, *, limit: int = 620) -> str:
+    text = str(value or "")
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _source_date(value: str) -> str:
+    match = re.search(r"\b(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\b", value)
+    if not match:
+        return ""
+    return f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+
+
+def _summary_source_excerpt(summary: str, url: str) -> str:
+    index = summary.find(url)
+    if index < 0:
+        return ""
+    start = max(0, summary.rfind("\n", 0, index) + 1)
+    end = summary.find("\n", index)
+    return _clean_document_text(summary[start : len(summary) if end < 0 else end])
 
 
 def _conversation_records(store: RunStore, selected: RunRecord) -> list[RunRecord]:

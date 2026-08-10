@@ -1,76 +1,75 @@
-# LightWorker Active-Run and Composer QA
+# LightWorker Message Actions, Sidebar, and Citation QA
 
-- Source visual truth: `/var/folders/d2/_9y5p7g94g7fq81k1qz8kxz80000gn/T/codex-clipboard-744535a6-65da-4227-96da-14d837acebd4.png`
-- Active implementation screenshot: `/tmp/lightworker-active-layout-v2.png`
-- Completed implementation screenshot: `/tmp/lightworker-completed-layout-v2.png`
-- Narrow implementation screenshot: `/tmp/lightworker-narrow-layout-v2.png`
-- Combined active-state comparison: `/tmp/lightworker-active-comparison-v2.png`
-- Compact composer desktop screenshot: `/tmp/lightworker-compact-composer-desktop.png`
-- Compact composer narrow screenshot: `/tmp/lightworker-compact-composer-narrow.png`
-- Compact composer focused comparison: `/tmp/lightworker-compact-composer-comparison.png`
-- Source pixels: `1516 × 838`
-- Desktop implementation viewport: `1280 × 587`, device scale factor `1`
-- Narrow implementation viewport: `720 × 900`, device scale factor `1`
-- Comparison normalization: source and desktop implementation were each scaled to `1000px` width and stacked vertically.
+- Message-action reference: `/var/folders/d2/_9y5p7g94g7fq81k1qz8kxz80000gn/T/codex-clipboard-e17c3a6c-ae40-4a30-baf8-55b51155d914.png`
+- Citation reference: `/var/folders/d2/_9y5p7g94g7fq81k1qz8kxz80000gn/T/codex-clipboard-439f15c0-01e2-47ed-995c-b982472ba033.png`
+- Hover implementation: `/tmp/lightworker-message-actions-hover.png`
+- Citation implementation: `/tmp/lightworker-citation-popover.png`
+- Collapsed-sidebar implementation: `/tmp/lightworker-sidebar-collapsed.png`
+- Message-action comparison: `/tmp/lightworker-message-actions-comparison.png`
+- Citation comparison: `/tmp/lightworker-citation-comparison.png`
+- Desktop verification viewport: `1280 × 800`, device scale factor `1`
+- Narrow verification viewport: `720 × 900`, device scale factor `1`
 
 ## Implemented structure
 
-The active assistant message now follows the reference hierarchy: elapsed status and divider, a short runtime explanation, real tool activity rows in execution order, a centered live progress pill, and a compact rounded composer. On success, the process area collapses to `已处理 {elapsed}` while the final Markdown answer remains visible below it.
+User and assistant message blocks now expose a bottom-left action row on hover or keyboard focus. The row provides working Copy, Like, Complaint, and creation-time controls. Like and Complaint are mutually exclusive, toggleable, and retained locally per run and role. Touch and narrow layouts keep these actions visible because hover is not dependable there.
 
-The composer uses real LightWorker controls only. New tasks retain workspace-source and runtime-settings controls. Existing conversations show the inherited workspace, active runs expose a functional Stop control, the configured model is visible on desktop, and Send remains available for follow-up or steering.
+The desktop conversation sidebar can be collapsed from its own header and restored from the chat header. The choice survives reloads. At narrow widths the existing off-canvas navigation remains authoritative so the desktop collapsed state does not remove mobile navigation.
+
+Final answers now receive numbered source badges. Standard Markdown source links are annotated in place; older answers without inline links receive a compact source tail after the last answer paragraph. Selecting a badge opens a document preview with the source host, source/observation date, document title, captured excerpt, and a real external link. Citation data is derived from web, browser, HTTP, and RAG tool evidence rather than invented client-side metadata.
 
 ## Required fidelity surfaces
 
-- Fonts and typography: retained the product's Inter/system Chinese stack. Runtime prose uses a more readable `15px` scale and generous line height; metadata remains visually subordinate.
-- Spacing and layout: active content follows the source order without nested cards. Tool rows use a flat vertical rhythm. Following direct user feedback, the composer is now `21px` rounded and `108px` minimum height on desktop, with text above a bottom toolbar.
-- Colors and tokens: intentionally retained LightWorker's light theme. Neutral surface, divider, muted metadata, success, and stop colors reuse existing tokens instead of introducing a second theme.
-- Shape and surfaces: the process stream is borderless except for the status divider; the composer keeps the reference's rounded surface and restrained elevation at the user-requested compact height.
-- Copy and content: all rows derive from actual run data. Tool names are translated into readable activity labels while preserving the technical tool name for inspection.
-- Icons and assets: the reference contains no product imagery that must be copied. No fake decorative images, handcrafted SVGs, or placeholder assets were introduced; existing text controls remain consistent with the established LightWorker UI.
-- States and behavior: verified active progress, functional Stop, completion collapse, manual expand/collapse, final Markdown visibility, continuing-task context, and model display.
-- Accessibility: controls remain semantic buttons, the progress line is `aria-live`, focus styles are inherited, and mobile tap targets for Send and Stop are at least `42px` high.
-- Responsiveness: at `720 × 900`, the model label is suppressed, technical tool names are hidden, the composer remains usable, and there is no horizontal overflow.
+- Fonts and typography: retained LightWorker's Inter/system Chinese stack. Action metadata is intentionally subordinate; citation titles and excerpts follow the reference's strong-title/readable-snippet hierarchy.
+- Spacing and layout: message actions sit under the message content without shifting it on hover. The source popover anchors next to the selected badge, remains inside the viewport, and uses a compact reading width.
+- Colors and tokens: retained the product's light theme while mapping the reference's neutral controls and elevated citation card to existing surface, border, shadow, muted, success, and danger tokens.
+- Shape and surfaces: action rows stay flat and borderless. The citation preview uses the reference's rounded elevated card rather than adding a permanent container around every citation.
+- Copy and content: labels are concise Chinese product copy. Creation times use the actual turn timestamps. Preview text and URLs come from captured evidence.
+- Icons and assets: no placeholder imagery, CSS art, handcrafted SVGs, or fake source logos were introduced. Text controls remain consistent with the existing LightWorker visual language while preserving every requested function.
+- States and interactions: verified hidden, hover/focus-visible, liked, complained, cancelled-feedback, citation-open, citation-close, sidebar-collapsed, sidebar-expanded, and reload-persisted states.
+- Accessibility: all actions are semantic buttons; feedback exposes `aria-pressed`; citation badges expose expanded state and descriptive labels; the popover is a labelled dialog; Escape and outside click close it; existing focus rings remain available.
+- Responsiveness: at `720 × 900`, page width equals viewport width, the sidebar stays off-canvas, both message-action groups are visible, all eight citation badges wrap without clipping, and the composer remains `700 × 104px`.
 
 ## Comparison history
 
 ### Iteration 1
 
-- Finding: runtime inspector panels appeared before tool activity, weakening the reference's `explanation → activity` reading order.
-- Severity: P2, layout/content hierarchy.
-- Fix: moved the activity stream immediately below the assistant intro and kept optional runtime inspector sections after it.
+- Finding: always-visible desktop actions made completed answers feel noisy compared with the hover-led reference.
+- Severity: P2, behavior/visual density.
+- Fix: reserve stable action-row space but reveal controls only on message hover or `focus-within`; retain visibility on touch/narrow devices.
 
-- Finding: the centered progress pill used a translucent background, allowing long underlying text to reduce legibility.
-- Severity: P2, color/contrast.
-- Fix: changed it to an opaque neutral surface with a subtle shadow.
+- Finding: duplicating the existing answer-level Copy button would expose two Copy controls for the same assistant output.
+- Severity: P2, content/interaction clarity.
+- Fix: removed the old top-right answer toolbar and consolidated Copy with Like, Complaint, and time in the message action row.
 
 ### Iteration 2
 
-- Finding: the generic `Agentic Loop` stage row duplicated the live progress pill and made the activity stream feel like a nested card.
-- Severity: P2, spacing/shape.
-- Fix: hide the generic stage summary when actual tools or notices exist and stream the tool rows directly.
+- Finding: older stored answers did not contain inline Markdown links even when tool evidence included sources.
+- Severity: P1, feature completeness.
+- Fix: added structured citation extraction to run and conversation payloads and appended unmatched source badges to the final answer paragraph. Agent prompts now request claim-adjacent Markdown links for future output.
 
-- Finding: the initial narrow layout kept too much technical metadata in the bottom toolbar and activity rows.
-- Severity: P2, responsiveness.
-- Fix: hide the model label and technical tool code at narrow widths while retaining readable action labels and controls.
+- Finding: direct browser extraction sometimes exposed only the domain as the source title.
+- Severity: P2, citation content hierarchy.
+- Fix: parse both HTML `<title>` and captured `Title:` metadata, while preferring a captured description for the preview excerpt.
 
 ### Iteration 3
 
-- Finding: direct user review identified the composer as taking too much vertical space.
-- Severity: P2, layout density.
-- Fix: reduced desktop minimum height from `132px` to `108px`, narrow minimum height from `116px` to `104px`, tightened internal padding and textarea height, and preserved `42px` Send/Stop targets.
-- Post-fix evidence: `/tmp/lightworker-compact-composer-comparison.png` shows the same rounded composer hierarchy at a lower density; `/tmp/lightworker-compact-composer-narrow.png` confirms that mobile controls remain usable without clipping.
+- Finding: collapsing the desktop sidebar needed an obvious recovery control and reload persistence.
+- Severity: P1, navigation behavior.
+- Fix: added paired Collapse/Conversation controls, synchronized expanded state, stored the preference locally, and verified both collapsed and expanded states after reload.
 
 ### Final verification
 
-- Active desktop: real run displayed elapsed time, runtime intro, live network activity, progress pill, model, Stop, and Send.
-- Completed desktop: process was collapsed by default, retained elapsed time, and kept the final Markdown answer expanded; expanding exposed the stored activity stream and collapsing hid it again.
-- Compact desktop composer: browser measurement confirms an `880 × 108px` form surface.
-- Narrow viewport: compact composer and toolbar remain visible without horizontal clipping or unusable controls.
-- Browser console: no warnings or errors.
+- Desktop hover: action row changes from `opacity: 0; visibility: hidden` to visible under the assistant message; both user and assistant groups are mounted.
+- Feedback: Like activates; Complaint clears Like and activates itself; selecting Complaint again clears the state.
+- Citation: eight real evidence sources render; the first preview resolves to `https://www.chinamoney.com.cn/chinese/bkccpr/`, shows the parsed Chinese document title, a captured excerpt, and observation time.
+- Sidebar: collapsed and expanded preferences each survived a full reload.
+- Narrow viewport: `body.scrollWidth === innerWidth === 720`; no horizontal overflow; two message-action groups and eight citation badges remain present.
+- Source/implementation comparisons: `/tmp/lightworker-message-actions-comparison.png` and `/tmp/lightworker-citation-comparison.png` confirm the requested control placement and source-card hierarchy while preserving LightWorker's established light theme.
 - Remaining P0/P1/P2 findings: none.
 
 ## Follow-up polish
 
-- None required for the requested interaction. The intentional light-theme difference preserves the existing product identity while matching the reference layout and behavior.
+- None required for the requested interaction. Source-site icons can be added later only when trustworthy icon metadata is available; no fake logos are used now.
 
 final result: passed

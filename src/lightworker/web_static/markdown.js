@@ -52,6 +52,12 @@
         `<a href="${escapeHtml(href)}"${titleAttribute}${external ? ' target="_blank" rel="noopener noreferrer"' : ""}>${renderInline(label)}</a>`,
       );
     });
+    text = text.replace(/https?:\/\/[^\s<>\u0000]+/gi, (rawUrl) => {
+      const url = rawUrl.replace(/[),.;:!?，。；：！？）】]+$/g, "");
+      const suffix = rawUrl.slice(url.length);
+      const href = safeHref(url);
+      return `${token(`<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`)}${suffix}`;
+    });
 
     text = escapeHtml(text);
     text = text

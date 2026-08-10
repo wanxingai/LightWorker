@@ -6,9 +6,9 @@
     <meta name="color-scheme" content="light" />
     <title>LightWorker</title>
     <meta name="description" content="以聊天方式提交并观察通用任务。" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260811-4" />
-    <script src="/static/markdown.js?v=20260811-4" defer></script>
-    <script src="/static/app.js?v=20260811-4" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260811-5" />
+    <script src="/static/markdown.js?v=20260811-5" defer></script>
+    <script src="/static/app.js?v=20260811-5" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -18,6 +18,7 @@
             <span class="brand-mark">L</span>
             <span>LightWorker</span>
           </a>
+          <button class="icon-button desktop-sidebar-collapse" id="sidebarCollapseButton" type="button" aria-label="收起对话列表">收起</button>
           <button class="icon-button mobile-sidebar-close" id="sidebarCloseButton" type="button">关闭</button>
         </div>
 
@@ -47,10 +48,13 @@
 
       <main class="chat-shell">
         <header class="chat-header">
-          <button class="icon-button mobile-menu-button" id="sidebarOpenButton" type="button">任务</button>
-          <div class="chat-title">
-            <strong id="chatTitle">新任务</strong>
-            <span id="chatMeta">本机隔离执行</span>
+          <div class="header-main">
+            <button class="icon-button mobile-menu-button" id="sidebarOpenButton" type="button">任务</button>
+            <button class="icon-button desktop-sidebar-expand" id="sidebarExpandButton" type="button" aria-label="展开对话列表">对话</button>
+            <div class="chat-title">
+              <strong id="chatTitle">新任务</strong>
+              <span id="chatMeta">本机隔离执行</span>
+            </div>
           </div>
           <div class="header-actions">
             <span class="run-status is-hidden" id="runStatus">—</span>
@@ -81,6 +85,7 @@
                 <div class="message-label">你</div>
                 <div class="user-prompt" id="userPrompt"></div>
                 <div class="message-meta" id="userPromptMeta"></div>
+                <div class="message-actions is-hidden" id="currentUserActions"></div>
               </div>
             </article>
 
@@ -123,10 +128,6 @@
                   </div>
                 </details>
                 <section class="answer-block final-answer is-hidden" id="summaryBlock">
-                  <div class="answer-heading final-answer-toolbar">
-                    <strong>最终输出</strong>
-                    <button class="text-button" type="button" data-copy-target="summaryContent">复制</button>
-                  </div>
                   <div class="markdown-text" id="summaryContent"></div>
                 </section>
                 <section class="diff-block is-hidden" id="diffBlock">
@@ -139,6 +140,7 @@
                   </div>
                   <pre id="diffContent"></pre>
                 </section>
+                <div class="message-actions is-hidden" id="currentAssistantActions"></div>
               </div>
             </article>
           </div>
@@ -244,6 +246,16 @@
         </div>
       </form>
     </dialog>
+
+    <aside class="citation-popover is-hidden" id="citationPopover" role="dialog" aria-labelledby="citationTitle">
+      <div class="citation-popover-heading">
+        <span id="citationMeta">引用来源</span>
+        <button class="text-button" id="citationCloseButton" type="button">关闭</button>
+      </div>
+      <strong id="citationTitle">引用文档</strong>
+      <p id="citationExcerpt"></p>
+      <a id="citationLink" href="#" target="_blank" rel="noopener noreferrer">打开原文</a>
+    </aside>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
   </body>
