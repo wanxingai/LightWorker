@@ -1,0 +1,13 @@
+.git
+.venv
+.pytest_cache
+.ruff_cache
+__pycache__
+*.py[cod]
+dist
+build
+.lightworker
+benchmarks
+tests
+uv.lock
+

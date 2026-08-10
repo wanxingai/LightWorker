@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lightworker"
+version = "0.1.0"
+description = "Auditable, Docker-isolated coding worker powered by LightAgent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LightWorker contributors" }]
+dependencies = [
+  "LightAgent>=0.9.7,<0.10",
+  "pydantic>=2.8,<3",
+  "pydantic-settings>=2.8,<3",
+  "PyYAML>=6.0,<7",
+  "typer>=0.15,<1",
+  "rich>=13.9,<15",
+  "platformdirs>=4.3,<5",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-cov>=5,<7",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+lightworker = "lightworker.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lightworker"]
+
+[tool.hatch.build]
+exclude = [
+  "lightworker.local.yaml",
+  ".env",
+  ".env.*",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"benchmarks" = "lightworker/benchmark_data"
+"docker/Dockerfile.python311" = "lightworker/docker/Dockerfile.python311"
+
+[tool.uv.sources]
+LightAgent = { path = "../LightAgent", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "docker: requires a running Docker daemon",
+  "network: uses external network access",
+  "live: invokes a configured real language model",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

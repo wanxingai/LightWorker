@@ -1,0 +1,44 @@
+# LightWorker Phase 0 example configuration.
+# Keep API keys in LIGHTWORKER_API_KEY (or OPENAI_API_KEY), never in this file.
+
+image: lightworker-python:3.11
+language: bilingual
+max_repairs: 2
+
+model:
+  model: your-openai-compatible-model
+  # base_url: https://your-endpoint.example/v1
+  # provider: openai
+  api_key_env: LIGHTWORKER_API_KEY
+
+# Public HTTP capability used by the unified task flow. The key remains
+# ``analysis`` for backwards-compatible configuration loading.
+analysis:
+  enabled: true
+  allow_http: true
+  # Empty means any public HTTPS host; credentials remain bound to the host supplied with them.
+  allowed_hosts: []
+  max_requests: 12
+  request_timeout_seconds: 30
+  max_response_bytes: 262144
+
+limits:
+  cpus: 2
+  memory: 4g
+  pids: 256
+  task_timeout_seconds: 3600
+  command_timeout_seconds: 900
+  max_patch_bytes: 1048576
+  max_changed_files: 50
+  max_read_bytes: 524288
+  max_tool_output_bytes: 32768
+
+pip_index_url: https://pypi.org/simple
+max_pip_requirements: 10
+
+# Verification commands can also be supplied with repeated --test/--lint options.
+verification:
+  - name: pytest
+    argv: [pytest, -q]
+    kind: test
+    required: true

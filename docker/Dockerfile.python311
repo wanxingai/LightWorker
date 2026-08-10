@@ -1,0 +1,27 @@
+FROM python:3.11-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git ripgrep tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir "pytest>=8,<9" "ruff>=0.9,<1" "mypy>=1.14,<2" "build>=1.2,<2"
+
+RUN groupadd --gid 10001 worker \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin worker \
+    && mkdir -p /workspace /deps \
+    && chown -R worker:worker /workspace /deps
+
+COPY sandbox_helper.py /usr/local/lib/lightworker/sandbox_helper.py
+RUN printf '#!/bin/sh\nexec python /usr/local/lib/lightworker/sandbox_helper.py\n' > /usr/local/bin/lightworker-sandbox-helper \
+    && chmod 0555 /usr/local/bin/lightworker-sandbox-helper /usr/local/lib/lightworker/sandbox_helper.py
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONUSERBASE=/deps \
+    PATH=/deps/bin:/usr/local/bin:/usr/bin:/bin
+
+USER worker
+WORKDIR /workspace
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sleep", "infinity"]

@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>LightWorker</title>
+    <meta name="description" content="以聊天方式提交并观察通用任务。" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260810-2" />
+    <script src="/static/app.js?v=20260810-2" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="任务导航">
+        <div class="brand-row">
+          <a class="brand" href="/" aria-label="LightWorker 首页">
+            <span class="brand-mark">L</span>
+            <span>LightWorker</span>
+          </a>
+          <button class="icon-button mobile-sidebar-close" id="sidebarCloseButton" type="button">关闭</button>
+        </div>
+
+        <button class="new-chat-button" id="newTaskButton" type="button">
+          <span>新任务</span>
+        </button>
+
+        <div class="history-heading">
+          <span>最近任务</span>
+          <button class="icon-button" id="refreshButton" type="button">刷新</button>
+        </div>
+        <nav class="run-list" id="runList" aria-label="最近任务">
+          <div class="history-skeleton"></div>
+          <div class="history-skeleton"></div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="health-row">
+            <span class="status-dot" id="healthDot"></span>
+            <span id="healthLabel">正在连接…</span>
+          </div>
+          <span class="model-name" id="modelName">—</span>
+        </div>
+      </aside>
+
+      <div class="sidebar-scrim" id="sidebarScrim"></div>
+
+      <main class="chat-shell">
+        <header class="chat-header">
+          <button class="icon-button mobile-menu-button" id="sidebarOpenButton" type="button">任务</button>
+          <div class="chat-title">
+            <strong id="chatTitle">新任务</strong>
+            <span id="chatMeta">本机隔离执行</span>
+          </div>
+          <div class="header-actions">
+            <span class="run-status is-hidden" id="runStatus">—</span>
+            <button class="quiet-button is-hidden" id="resumeButton" type="button">恢复</button>
+            <button class="quiet-button is-hidden" id="rerunButton" type="button">重新验证</button>
+          </div>
+        </header>
+
+        <section class="chat-scroll" id="chatScroll" aria-live="polite">
+          <div class="welcome" id="welcomeState">
+            <div class="welcome-mark" aria-hidden="true">L</div>
+            <h1>今天想完成什么？</h1>
+            <p>描述任意目标，同一个任务可连续完成问答、检索、分析和工作区文件修改。</p>
+            <div class="welcome-hints">
+              <button type="button" data-prompt="把下面的资料整理成结构清晰的中文摘要，并列出待确认事项。">总结与写作</button>
+              <button type="button" data-prompt="检索并比较最近一周的行业动态，注明来源、时间和不确定性。">检索与分析</button>
+              <button type="button" data-prompt="分析现有仓库中的失败测试，定位根因并完成最小修复。">编码与修复</button>
+            </div>
+          </div>
+
+          <div class="conversation is-hidden" id="conversation">
+            <div id="conversationHistory"></div>
+            <article class="message message-user">
+              <div class="message-avatar">你</div>
+              <div class="message-body">
+                <div class="message-label">你</div>
+                <div class="user-prompt" id="userPrompt"></div>
+                <div class="message-meta" id="userPromptMeta"></div>
+              </div>
+            </article>
+
+            <article class="message message-assistant">
+              <div class="message-avatar assistant-avatar">L</div>
+              <div class="message-body">
+                <div class="message-label">LightWorker</div>
+                <div class="assistant-intro" id="assistantIntro">正在准备隔离工作区…</div>
+                <div class="activity-list" id="activityList"></div>
+                <div class="verification-card is-hidden" id="verificationCard"></div>
+                <section class="answer-block is-hidden" id="summaryBlock">
+                  <div class="answer-heading">
+                    <strong>任务总结</strong>
+                    <button class="text-button" type="button" data-copy-target="summaryContent">复制</button>
+                  </div>
+                  <div class="markdown-text" id="summaryContent"></div>
+                </section>
+                <section class="diff-block is-hidden" id="diffBlock">
+                  <div class="answer-heading">
+                    <div>
+                      <strong>文件变更</strong>
+                      <span id="diffStats">已生成 diff</span>
+                    </div>
+                    <button class="text-button" type="button" data-copy-target="diffContent">复制 diff</button>
+                  </div>
+                  <pre id="diffContent"></pre>
+                </section>
+                <div class="run-error is-hidden" id="runError"></div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="composer-wrap">
+          <form class="composer" id="taskForm">
+            <textarea
+              id="taskInput"
+              name="task"
+              rows="1"
+              required
+              placeholder="描述任意任务，按 Enter 提交…"
+              aria-label="任务描述"
+            ></textarea>
+            <div class="composer-toolbar">
+              <div class="composer-options" id="composerOptions">
+                <button class="source-button" id="sourceButton" type="button" aria-expanded="false">
+                  <span id="sourceButtonLabel">空目录</span>
+                </button>
+                <div class="source-menu is-hidden" id="sourceMenu">
+                  <label>
+                    <input type="radio" name="sourceMode" value="empty" checked />
+                    <span><strong>空目录</strong><small>创建受管理的新 Git 仓库</small></span>
+                  </label>
+                  <label>
+                    <input type="radio" name="sourceMode" value="existing" />
+                    <span><strong>已有仓库</strong><small>从本机 Git 仓库创建隔离快照</small></span>
+                  </label>
+                </div>
+                <button class="settings-button" id="settingsButton" type="button" aria-expanded="false">运行设置</button>
+              </div>
+              <button class="send-button" id="submitTaskButton" type="submit">提交</button>
+            </div>
+            <div class="repo-row is-hidden" id="repoRow">
+              <label for="repoInput">仓库绝对路径</label>
+              <input id="repoInput" name="repo" placeholder="/Users/you/projects/example" autocomplete="off" />
+            </div>
+            <div class="settings-panel is-hidden" id="settingsPanel">
+              <label>
+                <span>测试命令</span>
+                <input id="testInput" value="pytest -q" placeholder="pytest -q" autocomplete="off" />
+                <small>每行一条安全白名单命令</small>
+              </label>
+              <label>
+                <span>Lint 命令</span>
+                <input id="lintInput" placeholder="ruff check ." autocomplete="off" />
+                <small>可选</small>
+              </label>
+              <label>
+                <span>最大修复轮数</span>
+                <select id="repairsInput">
+                  <option value="0">0</option>
+                  <option value="1">1</option>
+                  <option value="2" selected>2</option>
+                  <option value="3">3</option>
+                </select>
+              </label>
+              <label class="checkbox-row">
+                <input id="dirtyInput" type="checkbox" disabled />
+                <span>包含已有仓库的未提交改动</span>
+              </label>
+            </div>
+          </form>
+          <p class="composer-note" id="composerNote">默认从空目录开始 · 原仓库不会被容器挂载</p>
+        </section>
+      </main>
+    </div>
+
+    <dialog class="approval-dialog" id="approvalDialog">
+      <form method="dialog" id="approvalForm">
+        <div>
+          <span class="dialog-kicker">需要你的确认</span>
+          <h2 id="approvalTitle">高风险操作需要确认</h2>
+          <p id="approvalDescription"></p>
+          <div class="approval-action" id="approvalAction"></div>
+        </div>
+        <label class="approval-note">
+          <span>备注（可选）</span>
+          <textarea id="approvalNote" rows="3" placeholder="记录批准条件或拒绝原因"></textarea>
+        </label>
+        <div class="dialog-actions">
+          <button class="danger-button" id="rejectApprovalButton" type="button">拒绝</button>
+          <button class="primary-button" id="approveApprovalButton" type="button">允许并继续</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

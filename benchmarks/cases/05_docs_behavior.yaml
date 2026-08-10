@@ -1,0 +1,7 @@
+case_id: docs-behavior-sync
+task_zh: 将客户端默认超时调整为文档约定的 10 秒，并同步测试。
+task_en: Change the client default timeout to the documented 10 seconds and synchronize tests.
+fixture: docs_behavior
+test_command: [pytest, -q]
+forbidden_paths: [pyproject.toml]
+

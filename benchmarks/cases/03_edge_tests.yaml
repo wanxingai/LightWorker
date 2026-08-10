@@ -1,0 +1,7 @@
+case_id: slug-edge-cases
+task_zh: 修复 slugify 对连续空白和首尾空白的处理，并增加边界测试。
+task_en: Fix slugify handling of repeated and surrounding whitespace and add edge-case tests.
+fixture: slug_edges
+test_command: [pytest, -q]
+forbidden_paths: [pyproject.toml]
+

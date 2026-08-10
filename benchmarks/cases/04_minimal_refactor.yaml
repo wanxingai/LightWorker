@@ -1,0 +1,7 @@
+case_id: parser-refactor
+task_zh: 消除键值解析器中的重复分支，保持现有行为和异常类型不变。
+task_en: Remove duplicate branches in the key-value parser without changing behavior or exception types.
+fixture: parser_refactor
+test_command: [pytest, -q]
+forbidden_paths: [pyproject.toml]
+

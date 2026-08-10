@@ -1,0 +1,7 @@
+case_id: csv-empty-cell
+task_zh: 修复 CSV 导入中空数值单元格导致的异常，并保持非法非空值仍报错。
+task_en: Fix CSV import failures for empty numeric cells while preserving errors for invalid non-empty values.
+fixture: csv_empty
+test_command: [pytest, -q]
+forbidden_paths: [pyproject.toml]
+

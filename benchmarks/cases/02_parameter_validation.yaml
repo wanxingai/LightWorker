@@ -1,0 +1,7 @@
+case_id: parameter-validation
+task_zh: 为分页函数增加 page 和 page_size 的正整数校验并补齐测试。
+task_en: Add positive-integer validation for page and page_size and cover it with tests.
+fixture: parameter_validation
+test_command: [pytest, -q]
+forbidden_paths: [pyproject.toml]
+
