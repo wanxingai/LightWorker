@@ -86,6 +86,25 @@ def test_dashboard_and_health_never_expose_api_key(tmp_path: Path):
     assert "test-api-secret" not in health.text
 
 
+def test_web_ui_bundles_safe_markdown_renderer(tmp_path: Path):
+    client, _ = make_client(tmp_path)
+
+    page = client.get("/")
+    renderer = client.get("/static/markdown.js")
+    app = client.get("/static/app.js")
+
+    assert page.status_code == 200
+    assert renderer.status_code == 200
+    assert app.status_code == 200
+    assert '/static/markdown.js' in page.text
+    assert "LightWorkerMarkdown" in renderer.text
+    assert "escapeHtml" in renderer.text
+    assert "safeHref" in renderer.text
+    assert "setMarkdownContent" in app.text
+    assert "dataset.rawMarkdown" in app.text
+    assert 'summaryContent").textContent = content.trim()' not in app.text
+
+
 def test_create_run_validates_repo_and_commands(git_repo: Path, tmp_path: Path):
     CapturingRunner.specs.clear()
     manager = ImmediateManager()

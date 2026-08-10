@@ -46,6 +46,23 @@ const state = {
 
 const byId = (id) => document.getElementById(id);
 
+function setMarkdownContent(element, markdown) {
+  if (!element) return;
+  const source = String(markdown || "");
+  if (window.LightWorkerMarkdown?.setContent) {
+    window.LightWorkerMarkdown.setContent(element, source);
+    return;
+  }
+  element.dataset.rawMarkdown = source;
+  element.textContent = source;
+}
+
+function clearMarkdownContent(element) {
+  if (!element) return;
+  element.replaceChildren();
+  delete element.dataset.rawMarkdown;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -252,7 +269,7 @@ async function renderRun(run, { forceScroll = false } = {}) {
 
   byId("summaryBlock").classList.add("is-hidden");
   byId("diffBlock").classList.add("is-hidden");
-  byId("summaryContent").textContent = "";
+  clearMarkdownContent(byId("summaryContent"));
   byId("diffContent").textContent = "";
 
   const jobs = [];
@@ -284,6 +301,17 @@ function renderRuntimeInspector(run) {
     const task = document.createElement("span");
     task.textContent = agent.task || "";
     item.append(title, task);
+    if (agent.result?.trim()) {
+      const details = document.createElement("details");
+      details.className = "agent-result-details";
+      const summary = document.createElement("summary");
+      summary.textContent = agent.recovered ? "查看输出 · 已恢复" : "查看输出";
+      const result = document.createElement("div");
+      result.className = "markdown-text agent-result";
+      setMarkdownContent(result, agent.result.trim());
+      details.append(summary, result);
+      item.append(details);
+    }
     tree.append(item);
   });
 
@@ -458,7 +486,7 @@ function renderConversationHistory(turns, currentRunId) {
       heading.append(title);
       const content = document.createElement("div");
       content.className = "markdown-text";
-      content.textContent = turn.summary.trim();
+      setMarkdownContent(content, turn.summary.trim());
       block.append(heading, content);
       assistantBody.append(block);
     } else if (turn.error) {
@@ -717,7 +745,7 @@ async function loadSummary(runId, renderToken) {
   try {
     const content = await api(`/api/runs/${encodeURIComponent(runId)}/artifacts/summary`);
     if (state.currentRunId !== runId || state.renderToken !== renderToken) return;
-    byId("summaryContent").textContent = content.trim();
+    setMarkdownContent(byId("summaryContent"), content.trim());
     byId("summaryBlock").classList.remove("is-hidden");
   } catch (error) {
     showToast(`加载任务总结失败：${error.message}`, true);
@@ -964,7 +992,8 @@ function bindEvents() {
   });
   document.querySelectorAll("[data-copy-target]").forEach((button) => {
     button.addEventListener("click", async () => {
-      const value = byId(button.dataset.copyTarget).textContent;
+      const target = byId(button.dataset.copyTarget);
+      const value = target.dataset.rawMarkdown ?? target.textContent;
       try {
         await navigator.clipboard.writeText(value);
         showToast("已复制");
