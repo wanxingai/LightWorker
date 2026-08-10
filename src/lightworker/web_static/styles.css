@@ -1138,18 +1138,18 @@ select:focus-visible {
 .composer-wrap {
   position: relative;
   z-index: 9;
-  padding: 10px 24px 17px;
+  padding: 8px 24px 13px;
   background: linear-gradient(to top, white 82%, rgba(255, 255, 255, 0));
 }
 
 .composer {
   position: relative;
   width: min(880px, 100%);
-  min-height: 132px;
+  min-height: 108px;
   margin: 0 auto;
-  padding: 16px 17px 13px;
+  padding: 10px 14px 9px;
   border: 1px solid var(--line-strong);
-  border-radius: 24px;
+  border-radius: 21px;
   background: #fbfbfa;
   box-shadow: 0 10px 34px rgba(30, 32, 29, 0.11);
 }
@@ -1162,10 +1162,10 @@ select:focus-visible {
 .composer > textarea {
   display: block;
   width: 100%;
-  min-height: 58px;
-  max-height: 180px;
+  min-height: 36px;
+  max-height: 160px;
   resize: none;
-  padding: 2px 3px 10px;
+  padding: 1px 2px 6px;
   border: 0;
   outline: 0;
   background: transparent;
@@ -1184,7 +1184,7 @@ select:focus-visible {
 .composer-toolbar {
   justify-content: space-between;
   gap: 12px;
-  padding-top: 10px;
+  padding-top: 5px;
 }
 
 .composer-options {
@@ -1378,7 +1378,7 @@ select:focus-visible {
 }
 
 .composer-note {
-  margin: 8px auto 0;
+  margin: 6px auto 0;
   color: var(--muted);
   font-size: 10px;
   text-align: center;
@@ -1561,17 +1561,17 @@ select:focus-visible {
   }
 
   .composer-wrap {
-    padding: 9px 10px 11px;
+    padding: 7px 10px 9px;
   }
 
   .composer {
-    min-height: 116px;
-    padding: 13px 13px 11px;
-    border-radius: 21px;
+    min-height: 104px;
+    padding: 9px 11px 8px;
+    border-radius: 19px;
   }
 
   .composer > textarea {
-    min-height: 50px;
+    min-height: 34px;
     font-size: 14px;
   }
 

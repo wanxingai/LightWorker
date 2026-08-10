@@ -5,6 +5,9 @@
 - Completed implementation screenshot: `/tmp/lightworker-completed-layout-v2.png`
 - Narrow implementation screenshot: `/tmp/lightworker-narrow-layout-v2.png`
 - Combined active-state comparison: `/tmp/lightworker-active-comparison-v2.png`
+- Compact composer desktop screenshot: `/tmp/lightworker-compact-composer-desktop.png`
+- Compact composer narrow screenshot: `/tmp/lightworker-compact-composer-narrow.png`
+- Compact composer focused comparison: `/tmp/lightworker-compact-composer-comparison.png`
 - Source pixels: `1516 × 838`
 - Desktop implementation viewport: `1280 × 587`, device scale factor `1`
 - Narrow implementation viewport: `720 × 900`, device scale factor `1`
@@ -12,16 +15,16 @@
 
 ## Implemented structure
 
-The active assistant message now follows the reference hierarchy: elapsed status and divider, a short runtime explanation, real tool activity rows in execution order, a centered live progress pill, and a large rounded composer. On success, the process area collapses to `已处理 {elapsed}` while the final Markdown answer remains visible below it.
+The active assistant message now follows the reference hierarchy: elapsed status and divider, a short runtime explanation, real tool activity rows in execution order, a centered live progress pill, and a compact rounded composer. On success, the process area collapses to `已处理 {elapsed}` while the final Markdown answer remains visible below it.
 
 The composer uses real LightWorker controls only. New tasks retain workspace-source and runtime-settings controls. Existing conversations show the inherited workspace, active runs expose a functional Stop control, the configured model is visible on desktop, and Send remains available for follow-up or steering.
 
 ## Required fidelity surfaces
 
 - Fonts and typography: retained the product's Inter/system Chinese stack. Runtime prose uses a more readable `15px` scale and generous line height; metadata remains visually subordinate.
-- Spacing and layout: active content follows the source order without nested cards. Tool rows use a flat vertical rhythm. The composer is `24px` rounded, `132px` minimum height, with text above a bottom toolbar.
+- Spacing and layout: active content follows the source order without nested cards. Tool rows use a flat vertical rhythm. Following direct user feedback, the composer is now `21px` rounded and `108px` minimum height on desktop, with text above a bottom toolbar.
 - Colors and tokens: intentionally retained LightWorker's light theme. Neutral surface, divider, muted metadata, success, and stop colors reuse existing tokens instead of introducing a second theme.
-- Shape and surfaces: the process stream is borderless except for the status divider; the composer receives the reference's large rounded surface and restrained elevation.
+- Shape and surfaces: the process stream is borderless except for the status divider; the composer keeps the reference's rounded surface and restrained elevation at the user-requested compact height.
 - Copy and content: all rows derive from actual run data. Tool names are translated into readable activity labels while preserving the technical tool name for inspection.
 - Icons and assets: the reference contains no product imagery that must be copied. No fake decorative images, handcrafted SVGs, or placeholder assets were introduced; existing text controls remain consistent with the established LightWorker UI.
 - States and behavior: verified active progress, functional Stop, completion collapse, manual expand/collapse, final Markdown visibility, continuing-task context, and model display.
@@ -50,11 +53,19 @@ The composer uses real LightWorker controls only. New tasks retain workspace-sou
 - Severity: P2, responsiveness.
 - Fix: hide the model label and technical tool code at narrow widths while retaining readable action labels and controls.
 
+### Iteration 3
+
+- Finding: direct user review identified the composer as taking too much vertical space.
+- Severity: P2, layout density.
+- Fix: reduced desktop minimum height from `132px` to `108px`, narrow minimum height from `116px` to `104px`, tightened internal padding and textarea height, and preserved `42px` Send/Stop targets.
+- Post-fix evidence: `/tmp/lightworker-compact-composer-comparison.png` shows the same rounded composer hierarchy at a lower density; `/tmp/lightworker-compact-composer-narrow.png` confirms that mobile controls remain usable without clipping.
+
 ### Final verification
 
 - Active desktop: real run displayed elapsed time, runtime intro, live network activity, progress pill, model, Stop, and Send.
 - Completed desktop: process was collapsed by default, retained elapsed time, and kept the final Markdown answer expanded; expanding exposed the stored activity stream and collapsing hid it again.
-- Narrow viewport: no horizontal overflow or unusable controls.
+- Compact desktop composer: browser measurement confirms an `880 × 108px` form surface.
+- Narrow viewport: compact composer and toolbar remain visible without horizontal clipping or unusable controls.
 - Browser console: no warnings or errors.
 - Remaining P0/P1/P2 findings: none.
 
