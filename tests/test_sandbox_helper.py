@@ -129,6 +129,13 @@ deleted file mode 100644
     with pytest.raises(sandbox_helper.HelperError, match="deletion"):
         sandbox_helper.apply_patch({"patch": deletion}, policy())
 
+    approved = sandbox_helper.apply_patch(
+        {"patch": deletion, "allow_delete": True},
+        policy(),
+    )
+    assert approved["changed_files"] == ["app.py"]
+    assert not (helper_workspace / "app.py").exists()
+
 
 @pytest.mark.parametrize(
     "patch, message",

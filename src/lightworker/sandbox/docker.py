@@ -14,6 +14,9 @@ from .base import SandboxBackend, SandboxError
 
 
 class DockerSandbox(SandboxBackend):
+    supports_write = True
+    supports_shell = True
+
     def __init__(
         self,
         *,
@@ -25,6 +28,8 @@ class DockerSandbox(SandboxBackend):
         pip_index_url: str,
         max_pip_requirements: int,
         sensitive_read_patterns: list[str] | None = None,
+        shell_allowed_programs: list[str] | None = None,
+        max_shell_argv_items: int = 128,
     ):
         self.run_id = run_id
         self.workspace = workspace.resolve()
@@ -34,6 +39,8 @@ class DockerSandbox(SandboxBackend):
         self.pip_index_url = pip_index_url
         self.max_pip_requirements = max_pip_requirements
         self.sensitive_read_patterns = list(sensitive_read_patterns or [])
+        self.shell_allowed_programs = list(shell_allowed_programs or [])
+        self.max_shell_argv_items = max_shell_argv_items
         suffix = "".join(char for char in run_id.lower() if char.isalnum())[:20]
         if not suffix:
             raise ValueError("run_id must contain alphanumeric characters")
@@ -144,6 +151,8 @@ class DockerSandbox(SandboxBackend):
                     "max_output_bytes": self.limits.max_tool_output_bytes,
                     "pip_index_url": self.pip_index_url,
                     "max_pip_requirements": self.max_pip_requirements,
+                    "shell_allowed_programs": self.shell_allowed_programs,
+                    "max_shell_argv_items": self.max_shell_argv_items,
                 },
             }
             result = _docker(

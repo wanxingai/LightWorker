@@ -2,29 +2,48 @@
 
 from __future__ import annotations
 
+import asyncio
+import html
 import json
-import queue
 import re
 import threading
+import urllib.parse
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Query, status
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from . import __version__
 from .analysis_tools import CredentialVault, sanitize_and_capture_credentials
 from .config import WorkerConfig, parse_verification_command
-from .models import RunRecord, RunStatus, TaskSpec, VerificationCommand, VerificationKind
+from .context import ContextCompressor
+from .control import ControlStore
+from .goals import GoalManager
+from .memory import WorkspaceMemory, workspace_scope
+from .message_queue import ConversationMessageQueue
+from .models import (
+    GoalBudget,
+    RunRecord,
+    RunStatus,
+    RuntimeMode,
+    TaskSpec,
+    VerificationCommand,
+    VerificationKind,
+)
 from .policy import redact_value
+from .rag import RAGIndex
 from .sandbox_helper import HelperError, validate_command
+from .skills import SkillRegistry
 from .storage import RunStore
+from .tool_protocol import ApprovalBroker, EventLog
 from .workflow import CodingTaskRunner
 from .workspace import WorkspaceError, WorkspaceManager
 
@@ -33,10 +52,21 @@ ARTIFACTS = {
     "summary": ("summary.md", "text/markdown; charset=utf-8"),
     "diff": ("changes.patch", "text/x-diff; charset=utf-8"),
     "trace": ("trace.jsonl", "application/x-ndjson; charset=utf-8"),
+    "session": ("lightagent-session.json", "application/json; charset=utf-8"),
+    "runtime": ("lightagent-runtime.json", "application/json; charset=utf-8"),
+    "conversation": ("lightagent-conversation.json", "application/json; charset=utf-8"),
     "status": ("git-status.txt", "text/plain; charset=utf-8"),
 }
 ACTIVE_STATUSES = {RunStatus.CREATED, RunStatus.PREPARING, RunStatus.RUNNING}
+QUEUE_BLOCKING_STATUSES = ACTIVE_STATUSES | {
+    RunStatus.NEEDS_ATTENTION,
+    RunStatus.PAUSED,
+    RunStatus.WAITING_INPUT,
+    RunStatus.WAITING_APPROVAL,
+}
 SAFE_LOG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.log$")
+SOURCE_URL = re.compile(r"https?://[^\s<>\[\]{}\"']+", re.IGNORECASE)
+SOURCE_TOOL_MARKERS = ("web_search", "http_", "browser_", "rag_search", "rag_read")
 
 
 class RunCreateRequest(BaseModel):
@@ -47,6 +77,8 @@ class RunCreateRequest(BaseModel):
     lint_commands: list[str] = Field(default_factory=list, max_length=10)
     include_dirty: bool = False
     max_repairs: int | None = Field(default=None, ge=0, le=3)
+    runtime_mode: RuntimeMode | None = None
+    goal_mode: bool = True
 
     @field_validator("task")
     @classmethod
@@ -72,6 +104,39 @@ class FollowUpRequest(BaseModel):
         return value.strip()
 
 
+class ControlRequest(BaseModel):
+    reason: str = Field(default="", max_length=4000)
+
+
+class SteeringRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("message")
+    @classmethod
+    def reject_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value cannot be blank")
+        return value.strip()
+
+
+class MemoryCreateRequest(BaseModel):
+    kind: Literal["user", "feedback", "project", "reference"]
+    content: str = Field(min_length=1, max_length=20_000)
+    provenance: str = Field(min_length=1, max_length=2000)
+    confidence: float = Field(default=0.8, ge=0, le=1)
+    promote: bool = False
+
+
+class RAGIngestRequest(BaseModel):
+    paths: list[str] = Field(min_length=1, max_length=100)
+
+
+class GoalUpdateRequest(BaseModel):
+    objective: str | None = Field(default=None, min_length=1, max_length=20_000)
+    acceptance_criteria: list[str] | None = Field(default=None, max_length=100)
+    budget: GoalBudget | None = None
+
+
 class TaskManagerProtocol(Protocol):
     def submit(self, run_id: str, action: str, function: Callable[[], Any]) -> None: ...
 
@@ -80,23 +145,30 @@ class TaskManagerProtocol(Protocol):
     def close(self) -> None: ...
 
 
-class WebTaskManager:
-    """One daemon worker keeps local model and Docker tasks serialized."""
+class TaskScheduler:
+    """Bounded concurrent task scheduler with observable queue/running state."""
 
-    def __init__(self) -> None:
-        self._jobs: queue.Queue[tuple[str, str, Callable[[], Any]] | None] = queue.Queue()
+    def __init__(self, max_workers: int = 2) -> None:
         self._states: dict[str, dict[str, Any]] = {}
+        self._futures: dict[str, Future[Any]] = {}
         self._lock = threading.RLock()
-        self._thread = threading.Thread(target=self._work, name="lightworker-web-jobs", daemon=True)
-        self._thread.start()
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="lightworker-task",
+        )
 
     def submit(self, run_id: str, action: str, function: Callable[[], Any]) -> None:
         with self._lock:
             current = self._states.get(run_id)
             if current and current["state"] in {"queued", "running"}:
                 raise ValueError(f"run {run_id} already has an active job")
-            self._states[run_id] = {"state": "queued", "action": action, "error": None}
-            self._jobs.put((run_id, action, function))
+            self._states[run_id] = {
+                "state": "queued",
+                "action": action,
+                "error": None,
+                "queued_at": datetime.now(UTC).isoformat(),
+            }
+            self._futures[run_id] = self._executor.submit(self._work, run_id, action, function)
 
     def status(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -104,30 +176,38 @@ class WebTaskManager:
             return dict(value) if value else None
 
     def close(self) -> None:
-        self._jobs.put(None)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _work(self) -> None:
-        while True:
-            job = self._jobs.get()
-            if job is None:
-                return
-            run_id, action, function = job
+    def _work(self, run_id: str, action: str, function: Callable[[], Any]) -> None:
+        with self._lock:
+            self._states[run_id] = {
+                "state": "running",
+                "action": action,
+                "error": None,
+                "started_at": datetime.now(UTC).isoformat(),
+            }
+        try:
+            function()
+        except Exception as exc:  # pragma: no cover - defensive boundary around runner
             with self._lock:
-                self._states[run_id] = {"state": "running", "action": action, "error": None}
-            try:
-                function()
-            except Exception as exc:  # pragma: no cover - defensive boundary around runner
-                with self._lock:
-                    self._states[run_id] = {
-                        "state": "failed",
-                        "action": action,
-                        "error": str(exc),
-                    }
-            else:
-                with self._lock:
-                    self._states[run_id] = {"state": "completed", "action": action, "error": None}
-            finally:
-                self._jobs.task_done()
+                self._states[run_id] = {
+                    "state": "failed",
+                    "action": action,
+                    "error": str(exc),
+                    "ended_at": datetime.now(UTC).isoformat(),
+                }
+        else:
+            with self._lock:
+                self._states[run_id] = {
+                    "state": "completed",
+                    "action": action,
+                    "error": None,
+                    "ended_at": datetime.now(UTC).isoformat(),
+                }
+
+
+# Backwards-compatible import for integrations built against the serial scheduler.
+WebTaskManager = TaskScheduler
 
 
 def create_app(
@@ -137,13 +217,18 @@ def create_app(
     runner_factory: Callable[[WorkerConfig], CodingTaskRunner] = CodingTaskRunner,
 ) -> FastAPI:
     own_manager = task_manager is None
-    manager = task_manager or WebTaskManager()
+    manager = task_manager or TaskScheduler(max_workers=settings.scheduler.max_tasks)
     store = RunStore(settings.state_dir)
+    message_queue = ConversationMessageQueue(store)
+    queue_dispatch_lock = threading.RLock()
     _migrate_legacy_credentials(store, settings.state_dir)
+    _recover_stale_runs(store, manager)
     static_dir = Path(__file__).resolve().parent / "web_static"
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        for root_run_id in message_queue.roots():
+            _dispatch_next_queued_message(root_run_id)
         yield
         if own_manager:
             manager.close()
@@ -159,7 +244,161 @@ def create_app(
     app.state.settings = settings
     app.state.store = store
     app.state.task_manager = manager
+    app.state.message_queue = message_queue
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    def _run_blocks_queue(record: RunRecord, *, ignore_job: bool = False) -> bool:
+        job = manager.status(record.run_id)
+        return record.status in QUEUE_BLOCKING_STATUSES or bool(
+            not ignore_job and job and job.get("state") in {"queued", "running"}
+        )
+
+    def _prepare_followup_spec(
+        selected: RunRecord,
+        message: str,
+        *,
+        followup_id: str,
+        queue_item_id: str | None = None,
+    ) -> TaskSpec:
+        conversation = _conversation_records(store, selected)
+        parent = conversation[-1]
+        workspace = Path(parent.workspace or "").expanduser().resolve()
+        if not workspace.is_dir():
+            raise ValueError("saved workspace is missing")
+        try:
+            parent_spec = TaskSpec.model_validate(parent.metadata["task_spec"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError("saved task configuration is invalid") from exc
+
+        root = conversation[0]
+        sanitized, credentials = sanitize_and_capture_credentials(
+            [*[item.task for item in conversation], message]
+        )
+        CredentialVault(settings.state_dir).merge(root.run_id, credentials)
+        for record, safe_task in zip(conversation, sanitized[:-1], strict=True):
+            if record.task == safe_task:
+                continue
+            record.task = safe_task
+            record.metadata = redact_value(record.metadata)
+            store.save(record)
+        return TaskSpec(
+            run_id=followup_id,
+            repo=workspace,
+            task=sanitized[-1],
+            include_dirty=True,
+            language=parent_spec.language,
+            verification=parent_spec.verification,
+            max_repairs=parent_spec.max_repairs,
+            image=parent_spec.image,
+            source_mode=parent_spec.source_mode,
+            parent_run_id=parent.run_id,
+            root_run_id=root.run_id,
+            queue_item_id=queue_item_id,
+            conversation_context=_build_conversation_context(store, conversation, settings),
+            runtime_mode=parent_spec.runtime_mode,
+            goal_mode=parent_spec.goal_mode,
+        )
+
+    def _submit_spec(
+        spec: TaskSpec,
+        action: str,
+        *,
+        queue_item_id: str | None = None,
+    ) -> None:
+        root_run_id = spec.root_run_id or spec.run_id
+
+        def execute() -> Any:
+            try:
+                return runner_factory(settings).run(spec)
+            finally:
+                _settle_queue_and_dispatch(root_run_id, spec.run_id, queue_item_id)
+
+        manager.submit(spec.run_id, action, execute)
+
+    def _settle_queue_and_dispatch(
+        root_run_id: str,
+        run_id: str,
+        queue_item_id: str | None,
+    ) -> None:
+        try:
+            record = store.load(run_id)
+        except (FileNotFoundError, ValueError) as exc:
+            if queue_item_id:
+                message_queue.complete(root_run_id, queue_item_id, error=str(exc))
+            return
+        if _run_blocks_queue(record, ignore_job=True):
+            return
+        if queue_item_id:
+            message_queue.complete(root_run_id, queue_item_id)
+        _dispatch_next_queued_message(root_run_id, finished_run_id=run_id)
+
+    def _dispatch_next_queued_message(
+        root_run_id: str,
+        *,
+        finished_run_id: str | None = None,
+    ) -> str | None:
+        with queue_dispatch_lock:
+            try:
+                root = store.load(root_run_id)
+            except (FileNotFoundError, ValueError):
+                return None
+            conversation = _conversation_records(store, root)
+            parent = conversation[-1]
+            if _run_blocks_queue(parent, ignore_job=parent.run_id == finished_run_id):
+                return None
+
+            active_items = message_queue.active(root_run_id)
+            running = next(
+                (item for item in active_items if item.get("status") == "running"),
+                None,
+            )
+            if running is not None:
+                queued_run_id = str(running.get("run_id") or "")
+                queued_job = manager.status(queued_run_id) if queued_run_id else None
+                try:
+                    queued_record = store.load(queued_run_id)
+                except (FileNotFoundError, ValueError):
+                    if queued_job and queued_job.get("state") in {"queued", "running"}:
+                        return queued_run_id
+                    message_queue.release(root_run_id, str(running["id"]))
+                else:
+                    if _run_blocks_queue(
+                        queued_record,
+                        ignore_job=queued_record.run_id == finished_run_id,
+                    ):
+                        return queued_run_id
+                    message_queue.complete(root_run_id, str(running["id"]))
+
+            pending = next(
+                (item for item in message_queue.active(root_run_id) if item.get("status") == "pending"),
+                None,
+            )
+            if pending is None:
+                return None
+            followup_id = uuid4().hex
+            try:
+                spec = _prepare_followup_spec(
+                    parent,
+                    str(pending.get("message") or ""),
+                    followup_id=followup_id,
+                    queue_item_id=str(pending["id"]),
+                )
+            except ValueError as exc:
+                message_queue.complete(root_run_id, str(pending["id"]), error=str(exc))
+                return None
+            claimed = message_queue.claim(root_run_id, str(pending["id"]), followup_id)
+            if claimed is None:
+                return None
+            try:
+                _submit_spec(
+                    spec,
+                    "queued_followup",
+                    queue_item_id=str(claimed["id"]),
+                )
+            except ValueError as exc:
+                message_queue.release(root_run_id, str(claimed["id"]), str(exc))
+                return None
+            return followup_id
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
@@ -179,6 +418,8 @@ def create_app(
 
     @app.get("/api/runs")
     def list_runs() -> list[dict[str, Any]]:
+        for root_run_id in message_queue.roots():
+            _dispatch_next_queued_message(root_run_id)
         return _conversation_summaries(store, manager)
 
     @app.post("/api/runs", status_code=status.HTTP_202_ACCEPTED)
@@ -216,9 +457,11 @@ def create_app(
             max_repairs=(payload.max_repairs if payload.max_repairs is not None else settings.max_repairs),
             image=settings.image,
             source_mode=payload.source_mode,
+            runtime_mode=payload.runtime_mode or settings.runtime.mode,
+            goal_mode=payload.goal_mode,
         )
         try:
-            manager.submit(spec.run_id, "run", lambda: runner_factory(settings).run(spec))
+            _submit_spec(spec, "run")
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"run_id": spec.run_id, "status": "queued"}
@@ -226,54 +469,95 @@ def create_app(
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
         record = _load_record(store, run_id)
-        return _run_detail(store, record, manager.status(run_id))
+        root_run_id = _root_run_id(record)
+        _dispatch_next_queued_message(root_run_id)
+        active_messages = message_queue.active(root_run_id)
+        native = message_queue.snapshot(root_run_id)
+        payload = _run_detail(store, record, manager.status(run_id))
+        payload["message_queue"] = redact_value(active_messages)
+        payload["conversation_runtime"] = redact_value(
+            {
+                "session_id": native["session"]["session_id"],
+                "source_of_truth": native["source_of_truth"],
+                "event_count": len(native["session"]["events"]),
+                "inbox": native["inbox"],
+            }
+        )
+        return payload
+
+    @app.get("/api/runs/{run_id}/events")
+    async def stream_events(
+        run_id: str,
+        after: int = Query(default=0, ge=0),
+    ) -> StreamingResponse:
+        _load_record(store, run_id)
+
+        async def generate():
+            cursor = after
+            idle_rounds = 0
+            while True:
+                events = EventLog(store, run_id).read(after=cursor, limit=500)
+                if events:
+                    idle_rounds = 0
+                    for event in events:
+                        cursor = max(cursor, int(event.get("sequence") or 0))
+                        yield (
+                            f"id: {cursor}\nevent: update\ndata: "
+                            + json.dumps(
+                                event,
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                else:
+                    idle_rounds += 1
+                    yield ": keep-alive\n\n"
+                current = store.load(run_id)
+                job = manager.status(run_id)
+                active = current.status in ACTIVE_STATUSES or bool(
+                    job and job.get("state") in {"queued", "running"}
+                )
+                if not active and idle_rounds >= 2:
+                    break
+                await asyncio.sleep(0.75)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
 
     @app.post("/api/runs/{run_id}/followups", status_code=status.HTTP_202_ACCEPTED)
     def create_followup(run_id: str, payload: FollowUpRequest) -> dict[str, Any]:
         selected = _load_record(store, run_id)
         conversation = _conversation_records(store, selected)
         parent = conversation[-1]
-        parent_job = manager.status(parent.run_id)
-        if parent.status in ACTIVE_STATUSES or (
-            parent_job and parent_job.get("state") in {"queued", "running"}
-        ):
-            raise HTTPException(status_code=409, detail="wait for the current turn to finish")
-        workspace = Path(parent.workspace or "").expanduser().resolve()
-        if not workspace.is_dir():
-            raise HTTPException(status_code=409, detail="saved workspace is missing")
-        try:
-            parent_spec = TaskSpec.model_validate(parent.metadata["task_spec"])
-        except (KeyError, ValueError) as exc:
-            raise HTTPException(status_code=409, detail="saved task configuration is invalid") from exc
-
         root = conversation[0]
-        sanitized, credentials = sanitize_and_capture_credentials(
-            [*[item.task for item in conversation], payload.message]
-        )
-        CredentialVault(settings.state_dir).merge(root.run_id, credentials)
-        for record, safe_task in zip(conversation, sanitized[:-1], strict=True):
-            if record.task == safe_task:
-                continue
-            record.task = safe_task
-            record.metadata = redact_value(record.metadata)
-            store.save(record)
-        followup_id = uuid4().hex
-        spec = TaskSpec(
-            run_id=followup_id,
-            repo=workspace,
-            task=sanitized[-1],
-            include_dirty=True,
-            language=parent_spec.language,
-            verification=parent_spec.verification,
-            max_repairs=parent_spec.max_repairs,
-            image=parent_spec.image,
-            source_mode=parent_spec.source_mode,
-            parent_run_id=parent.run_id,
-            root_run_id=root.run_id,
-            conversation_context=_build_conversation_context(store, conversation),
-        )
+        parent_job = manager.status(parent.run_id)
+        active_queue = message_queue.active(root.run_id)
+        if (
+            parent.status in QUEUE_BLOCKING_STATUSES
+            or (parent_job and parent_job.get("state") in {"queued", "running"})
+            or active_queue
+        ):
+            safe_message, credentials = sanitize_and_capture_credentials([payload.message])
+            CredentialVault(settings.state_dir).merge(root.run_id, credentials)
+            item = message_queue.enqueue(root.run_id, safe_message[0])
+            EventLog(store, parent.run_id).emit("followup_queued", item)
+            if parent.status not in QUEUE_BLOCKING_STATUSES and not (
+                parent_job and parent_job.get("state") in {"queued", "running"}
+            ):
+                _dispatch_next_queued_message(root.run_id)
+            return {
+                "run_id": parent.run_id,
+                "root_run_id": root.run_id,
+                "parent_run_id": _parent_run_id(parent),
+                "status": "followup_queued",
+                "queue_item": redact_value(item),
+            }
         try:
-            manager.submit(spec.run_id, "followup", lambda: runner_factory(settings).run(spec))
+            spec = _prepare_followup_spec(parent, payload.message, followup_id=uuid4().hex)
+            _submit_spec(spec, "followup")
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
@@ -283,17 +567,57 @@ def create_app(
             "status": "queued",
         }
 
+    @app.post("/api/runs/{run_id}/queue/{item_id}/guide")
+    def guide_queued_message(run_id: str, item_id: str) -> dict[str, Any]:
+        selected = _load_record(store, run_id)
+        conversation = _conversation_records(store, selected)
+        current = conversation[-1]
+        current_job = manager.status(current.run_id)
+        if current.status not in ACTIVE_STATUSES and not (
+            current_job and current_job.get("state") in {"queued", "running"}
+        ):
+            raise HTTPException(status_code=409, detail="only an active run accepts guidance")
+        root_run_id = conversation[0].run_id
+        try:
+            item = message_queue.guide(root_run_id, item_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="queued message not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        steering = ControlStore(store, current.run_id).add_steering(str(item.get("message") or ""))
+        EventLog(store, current.run_id).emit(
+            "queued_followup_guided",
+            {"queue_item_id": item_id, "steering": steering},
+        )
+        return {
+            "run_id": current.run_id,
+            "root_run_id": root_run_id,
+            "status": "guidance_accepted",
+            "queue_item": redact_value(item),
+        }
+
     @app.get("/api/runs/{run_id}/artifacts/{artifact}")
     def get_artifact(run_id: str, artifact: str) -> PlainTextResponse:
-        _load_record(store, run_id)
+        record = _load_record(store, run_id)
         if artifact not in ARTIFACTS:
             raise HTTPException(status_code=404, detail="unknown artifact")
         filename, media_type = ARTIFACTS[artifact]
+        artifact_run_id = _root_run_id(record) if artifact == "conversation" else run_id
         return PlainTextResponse(
-            _read_artifact(store, run_id, filename),
+            _read_artifact(store, artifact_run_id, filename),
             media_type=media_type,
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.get("/api/runs/{run_id}/browser/{name}")
+    def get_browser_artifact(run_id: str, name: str) -> FileResponse:
+        _load_record(store, run_id)
+        if not re.fullmatch(r"screenshot-[1-9][0-9]*\.png", name):
+            raise HTTPException(status_code=404, detail="unknown browser artifact")
+        path = store.artifact_path(run_id, f"browser/{name}")
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="browser artifact not available")
+        return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     @app.get("/api/runs/{run_id}/logs")
     def list_logs(run_id: str) -> list[dict[str, Any]]:
@@ -321,15 +645,50 @@ def create_app(
     @app.post("/api/runs/{run_id}/resume", status_code=status.HTTP_202_ACCEPTED)
     def resume_run(run_id: str) -> dict[str, str]:
         record = _load_record(store, run_id)
-        if record.status not in {RunStatus.FAILED, RunStatus.INTERRUPTED}:
-            raise HTTPException(status_code=409, detail="only failed or interrupted runs can resume")
+        if record.status not in {
+            RunStatus.FAILED,
+            RunStatus.INTERRUPTED,
+            RunStatus.PAUSED,
+            RunStatus.NEEDS_ATTENTION,
+        }:
+            raise HTTPException(status_code=409, detail="run is not resumable")
         if record.metadata.get("execution_mode") in {"general", "analysis"}:
             raise HTTPException(
                 status_code=409,
-                detail="general tasks continue through a follow-up message rather than a coding checkpoint",
+                detail="legacy general tasks continue through a follow-up message",
             )
+        ControlStore(store, run_id).set_state("running")
         _submit_existing(manager, run_id, "resume", lambda: runner_factory(settings).resume(run_id))
         return {"run_id": run_id, "status": "queued"}
+
+    @app.post("/api/runs/{run_id}/pause")
+    def pause_run(run_id: str, payload: ControlRequest) -> dict[str, Any]:
+        record = _load_record(store, run_id)
+        if record.status not in ACTIVE_STATUSES:
+            raise HTTPException(status_code=409, detail="only an active run can be paused")
+        value = ControlStore(store, run_id).set_state("paused", payload.reason.strip())
+        EventLog(store, run_id).emit("pause_requested", value)
+        return value
+
+    @app.post("/api/runs/{run_id}/cancel")
+    def cancel_run(run_id: str, payload: ControlRequest) -> dict[str, Any]:
+        record = _load_record(store, run_id)
+        if record.status not in ACTIVE_STATUSES:
+            raise HTTPException(status_code=409, detail="only an active run can be cancelled")
+        value = ControlStore(store, run_id).set_state("cancelled", payload.reason.strip())
+        EventLog(store, run_id).emit("cancel_requested", value)
+        return value
+
+    @app.post("/api/runs/{run_id}/steer")
+    def steer_run(run_id: str, payload: SteeringRequest) -> dict[str, Any]:
+        record = _load_record(store, run_id)
+        if record.status not in ACTIVE_STATUSES:
+            raise HTTPException(status_code=409, detail="only an active run accepts live steering")
+        sanitized, credentials = sanitize_and_capture_credentials([payload.message])
+        CredentialVault(settings.state_dir).merge(_root_run_id(record), credentials)
+        value = ControlStore(store, run_id).add_steering(sanitized[0])
+        EventLog(store, run_id).emit("steering_received", value)
+        return value
 
     @app.post("/api/runs/{run_id}/rerun", status_code=status.HTTP_202_ACCEPTED)
     def rerun_verify(run_id: str) -> dict[str, str]:
@@ -347,6 +706,20 @@ def create_app(
     @app.post("/api/runs/{run_id}/approval", status_code=status.HTTP_202_ACCEPTED)
     def decide_approval(run_id: str, payload: ReviewDecisionRequest) -> dict[str, str]:
         _load_record(store, run_id)
+        tool_approval = _pending_tool_approval(store, run_id)
+        if tool_approval is not None:
+            _submit_existing(
+                manager,
+                run_id,
+                "approval",
+                lambda: runner_factory(settings).decide_approval(
+                    run_id,
+                    tool_approval["request_id"],
+                    payload.decision,
+                    payload.note.strip(),
+                ),
+            )
+            return {"run_id": run_id, "status": "queued"}
         flow_record = _load_flow_record(store, run_id)
         approval = _pending_approval(flow_record)
         if approval is None:
@@ -379,6 +752,156 @@ def create_app(
         }
         store.write_json(run_id, "review-decision.json", decision)
         return decision
+
+    @app.get("/api/capabilities")
+    def capabilities() -> dict[str, Any]:
+        return {
+            "runtime": {
+                "default": settings.runtime.mode.value,
+                "modes": ["agentic", "workflow"],
+                "goal": True,
+                "automatic_context_compression": True,
+            },
+            "tools": {
+                "docker_shell": settings.shell.enabled,
+                "web_search": settings.analysis.search_enabled,
+                "browser": settings.browser.enabled,
+                "browser_backend": settings.browser.backend,
+                "browser_profile": "ephemeral",
+                "skills": settings.skills.enabled,
+                "mcp": settings.mcp.enabled,
+                "rag_fts5": settings.rag.enabled,
+                "rag_embeddings": settings.rag.embeddings_enabled,
+                "memory": settings.memory.enabled,
+                "subagents": True,
+            },
+            "limits": settings.scheduler.model_dump(mode="json"),
+        }
+
+    @app.get("/api/runs/{run_id}/memory")
+    def list_memory(run_id: str, include_candidates: bool = True) -> list[dict[str, Any]]:
+        record = _load_record(store, run_id)
+        memory = WorkspaceMemory(
+            settings.state_dir,
+            candidate_ttl_days=settings.memory.candidate_ttl_days,
+        )
+        return memory.list(
+            scope=_scope_for_record(store, record),
+            include_candidates=include_candidates,
+        )
+
+    @app.get("/api/runs/{run_id}/goal")
+    def get_goal(run_id: str) -> dict[str, Any]:
+        _load_record(store, run_id)
+        try:
+            return GoalManager(store, run_id).load().model_dump(mode="json")
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="goal state not available") from exc
+
+    @app.patch("/api/runs/{run_id}/goal")
+    def update_goal(run_id: str, payload: GoalUpdateRequest) -> dict[str, Any]:
+        _load_record(store, run_id)
+        manager = GoalManager(store, run_id)
+        try:
+            goal = manager.load()
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail="goal state not available") from exc
+        if payload.objective is not None:
+            goal.objective = payload.objective
+        if payload.acceptance_criteria is not None:
+            goal.acceptance_criteria = [item for item in payload.acceptance_criteria if item.strip()]
+        if payload.budget is not None:
+            goal.budget = payload.budget
+        return manager.save(goal).model_dump(mode="json")
+
+    @app.post("/api/runs/{run_id}/memory")
+    def create_memory(run_id: str, payload: MemoryCreateRequest) -> dict[str, Any]:
+        record = _load_record(store, run_id)
+        memory = WorkspaceMemory(
+            settings.state_dir,
+            candidate_ttl_days=settings.memory.candidate_ttl_days,
+        )
+        try:
+            value = memory.propose(
+                scope=_scope_for_record(store, record),
+                kind=payload.kind,
+                content=payload.content,
+                provenance=payload.provenance,
+                confidence=payload.confidence,
+            )
+            return memory.promote(value["id"]) if payload.promote else value
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/runs/{run_id}/memory/{memory_id}/promote")
+    def promote_memory(run_id: str, memory_id: str) -> dict[str, Any]:
+        _load_record(store, run_id)
+        try:
+            return WorkspaceMemory(settings.state_dir).promote(memory_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/runs/{run_id}/memory/{memory_id}")
+    def delete_memory(run_id: str, memory_id: str) -> dict[str, bool]:
+        _load_record(store, run_id)
+        return {"ok": WorkspaceMemory(settings.state_dir).delete(memory_id)}
+
+    @app.get("/api/runs/{run_id}/skills")
+    def list_skills(run_id: str) -> dict[str, Any]:
+        record = _load_record(store, run_id)
+        workspace = Path(record.workspace or "").resolve()
+        if not workspace.is_dir():
+            raise HTTPException(status_code=409, detail="saved workspace is missing")
+        return SkillRegistry(workspace=workspace, config=settings.skills).manifest()
+
+    @app.get("/api/runs/{run_id}/rag")
+    def list_rag(run_id: str) -> list[dict[str, Any]]:
+        record = _load_record(store, run_id)
+        return RAGIndex(
+            settings.state_dir,
+            scope=_scope_for_record(store, record),
+            config=settings.rag,
+        ).list_documents()
+
+    @app.post("/api/runs/{run_id}/rag")
+    def ingest_rag(run_id: str, payload: RAGIngestRequest) -> dict[str, Any]:
+        record = _load_record(store, run_id)
+        workspace = Path(record.workspace or "").resolve()
+        if not workspace.is_dir():
+            raise HTTPException(status_code=409, detail="saved workspace is missing")
+        return RAGIndex(
+            settings.state_dir,
+            scope=_scope_for_record(store, record),
+            config=settings.rag,
+        ).ingest(workspace, payload.paths)
+
+    @app.delete("/api/runs/{run_id}/rag")
+    def remove_rag(run_id: str, path: str = Query(min_length=1, max_length=4096)) -> dict[str, bool]:
+        record = _load_record(store, run_id)
+        return {
+            "ok": RAGIndex(
+                settings.state_dir,
+                scope=_scope_for_record(store, record),
+                config=settings.rag,
+            ).remove(path)
+        }
+
+    @app.get("/api/mcp")
+    def mcp_configuration() -> dict[str, Any]:
+        return {
+            "enabled": settings.mcp.enabled,
+            "servers": {
+                name: {
+                    "transport": value.transport,
+                    "url_host": urllib.parse.urlsplit(value.url).hostname if value.url else None,
+                    "command": value.command,
+                    "disabled": value.disabled,
+                    "allowed_tools": value.allowed_tools,
+                    "read_only_tools": value.read_only_tools,
+                }
+                for name, value in settings.mcp.servers.items()
+            },
+        }
 
     return app
 
@@ -420,20 +943,22 @@ def _load_record(store: RunStore, run_id: str) -> RunRecord:
 
 
 def _run_summary(record: RunRecord, job: dict[str, Any] | None) -> dict[str, Any]:
-    return redact_value({
-        "run_id": record.run_id,
-        "task": record.task,
-        "repo": record.repo,
-        "status": record.status.value,
-        "current_step": record.current_step,
-        "updated_at": record.updated_at.isoformat(),
-        "verification_passed": sum(item.passed for item in record.verification),
-        "verification_total": len(record.verification),
-        "job": job,
-        "source_mode": _source_mode(record),
-        "parent_run_id": _parent_run_id(record),
-        "root_run_id": _root_run_id(record),
-    })
+    return redact_value(
+        {
+            "run_id": record.run_id,
+            "task": record.task,
+            "repo": record.repo,
+            "status": record.status.value,
+            "current_step": record.current_step,
+            "updated_at": record.updated_at.isoformat(),
+            "verification_passed": sum(item.passed for item in record.verification),
+            "verification_total": len(record.verification),
+            "job": job,
+            "source_mode": _source_mode(record),
+            "parent_run_id": _parent_run_id(record),
+            "root_run_id": _root_run_id(record),
+        }
+    )
 
 
 def _conversation_summaries(
@@ -457,27 +982,28 @@ def _conversation_summaries(
 
 def _run_detail(store: RunStore, record: RunRecord, job: dict[str, Any] | None) -> dict[str, Any]:
     flow_record = _load_flow_record(store, record.run_id)
+    events = EventLog(store, record.run_id).read(limit=500)
     has_changes = _has_text_artifact(store, record.run_id, "changes.patch")
     payload = redact_value(record.model_dump(mode="json"))
     payload["job"] = job
-    payload["steps"] = _load_steps(flow_record)
+    payload["steps"] = _load_steps(flow_record) or _agentic_steps(events, record)
     payload["current_step"] = _current_step(payload["steps"], record.current_step, job)
-    payload["activity"] = _load_activity(flow_record)
+    activity = _load_activity(flow_record) or _agentic_activity(events, record)
+    payload["activity"] = activity
+    payload["events"] = events
     payload["artifacts"] = {
-        name: (
-            has_changes
-            if name == "diff"
-            else store.artifact_path(record.run_id, filename).is_file()
-        )
+        name: (has_changes if name == "diff" else store.artifact_path(record.run_id, filename).is_file())
         for name, (filename, _) in ARTIFACTS.items()
     }
     payload["has_changes"] = has_changes
     approval_in_progress = bool(
-        job
-        and job.get("action") == "approval"
-        and job.get("state") in {"queued", "running"}
+        job and job.get("action") == "approval" and job.get("state") in {"queued", "running"}
     )
-    payload["approval_request"] = None if approval_in_progress else _pending_approval(flow_record)
+    payload["approval_request"] = (
+        None
+        if approval_in_progress
+        else (_pending_tool_approval(store, record.run_id) or _pending_approval(flow_record))
+    )
     payload["review"] = _read_optional_json(store, record.run_id, "review-decision.json")
     payload["source_mode"] = _source_mode(record)
     conversation = _conversation_records(store, record)
@@ -485,6 +1011,10 @@ def _run_detail(store: RunStore, record: RunRecord, job: dict[str, Any] | None) 
     payload["parent_run_id"] = _parent_run_id(record)
     payload["conversation_title"] = redact_value(conversation[0].task)
     payload["conversation"] = [_conversation_turn(store, item) for item in conversation]
+    payload["citations"] = _extract_citations(
+        activity,
+        _read_optional_text(store, record.run_id, "summary.md"),
+    )
     plan = _read_optional_json(store, record.run_id, "plan.json")
     task_type = str(plan.get("task_type") or "") if isinstance(plan, dict) else ""
     payload["task_type"] = task_type
@@ -494,24 +1024,218 @@ def _run_detail(store: RunStore, record: RunRecord, job: dict[str, Any] | None) 
         "follow-up-answer",
     }
     execution_mode = record.metadata.get("execution_mode")
-    payload["unified_mode"] = execution_mode == "unified"
+    payload["unified_mode"] = execution_mode in {"unified", "agentic"}
     payload["general_only"] = execution_mode in {"general", "analysis"}
     payload["analysis_only"] = execution_mode == "analysis"
+    payload["goal"] = _read_optional_json(store, record.run_id, "goal.json")
+    payload["agent_tree"] = _read_optional_json(store, record.run_id, "agent-tree.json") or {"agents": []}
+    payload["tool_manifest"] = _read_optional_json(store, record.run_id, "tool-manifest.json") or []
+    browser_dir = store.artifact_path(record.run_id, "browser")
+    payload["browser_artifacts"] = (
+        [path.name for path in sorted(browser_dir.glob("screenshot-*.png")) if path.is_file()]
+        if browser_dir.is_dir()
+        else []
+    )
     return payload
 
 
 def _conversation_turn(store: RunStore, record: RunRecord) -> dict[str, Any]:
-    return redact_value({
-        "run_id": record.run_id,
-        "message": record.task,
-        "status": record.status.value,
-        "created_at": record.created_at.isoformat(),
-        "updated_at": record.updated_at.isoformat(),
-        "error": record.error,
-        "source_mode": _source_mode(record),
-        "summary": _read_optional_text(store, record.run_id, "summary.md"),
-        "diff": _read_optional_text(store, record.run_id, "changes.patch"),
-    })
+    summary = _read_optional_text(store, record.run_id, "summary.md")
+    flow_record = _load_flow_record(store, record.run_id)
+    events = EventLog(store, record.run_id).read(limit=500)
+    activity = _load_activity(flow_record) or _agentic_activity(events, record)
+    return redact_value(
+        {
+            "run_id": record.run_id,
+            "message": record.task,
+            "status": record.status.value,
+            "created_at": record.created_at.isoformat(),
+            "updated_at": record.updated_at.isoformat(),
+            "error": record.error,
+            "source_mode": _source_mode(record),
+            "summary": summary,
+            "diff": _read_optional_text(store, record.run_id, "changes.patch"),
+            "citations": _extract_citations(activity, summary),
+        }
+    )
+
+
+def _extract_citations(activity: list[dict[str, Any]], summary: str | None) -> list[dict[str, Any]]:
+    sources: dict[str, dict[str, Any]] = {}
+
+    def add_source(
+        raw_url: Any,
+        *,
+        title: Any = "",
+        excerpt: Any = "",
+        observed_at: Any = None,
+        priority: int = 1,
+    ) -> None:
+        url = _safe_source_url(raw_url)
+        if not url:
+            return
+        parsed = urllib.parse.urlsplit(url)
+        cleaned_excerpt = _clean_document_text(excerpt)
+        date_material = cleaned_excerpt
+        cleaned_title = _clean_document_text(title, limit=180)
+        if not cleaned_title and cleaned_excerpt:
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", str(excerpt), re.IGNORECASE | re.DOTALL)
+            if title_match:
+                cleaned_title = _clean_document_text(title_match.group(1), limit=180)
+            else:
+                title_match = re.search(
+                    r"(?:^|\s)Title:\s*(.*?)(?:\s+(?:Description|Visible text|Content):|$)",
+                    cleaned_excerpt,
+                    re.IGNORECASE,
+                )
+                if title_match:
+                    cleaned_title = _clean_document_text(title_match.group(1), limit=180)
+        if re.match(r"^Title:\s*", cleaned_excerpt, re.IGNORECASE):
+            excerpt_match = re.search(
+                r"(?:^|\s)(?:Description|Visible text|Content):\s*(.*?)"
+                r"(?=\s+(?:Visible text|Content):|$)",
+                cleaned_excerpt,
+                re.IGNORECASE,
+            )
+            if excerpt_match:
+                cleaned_excerpt = _clean_document_text(excerpt_match.group(1))
+        source = {
+            "url": url,
+            "title": cleaned_title or parsed.netloc.removeprefix("www."),
+            "site": parsed.netloc.removeprefix("www."),
+            "excerpt": cleaned_excerpt,
+            "published_at": _source_date(f"{cleaned_title} {date_material}"),
+            "observed_at": str(observed_at or ""),
+            "_priority": priority,
+        }
+        current = sources.get(url)
+        if current is None:
+            sources[url] = source
+            return
+        if len(source["title"]) > len(current["title"]):
+            current["title"] = source["title"]
+        if len(source["excerpt"]) > len(current["excerpt"]):
+            current["excerpt"] = source["excerpt"]
+        current["published_at"] = current["published_at"] or source["published_at"]
+        current["observed_at"] = current["observed_at"] or source["observed_at"]
+        current["_priority"] = min(current["_priority"], source["_priority"])
+
+    for step in activity:
+        for tool in step.get("tools") or []:
+            name = str(tool.get("name") or "").lower()
+            if not any(marker in name for marker in SOURCE_TOOL_MARKERS):
+                continue
+            raw_output = str(tool.get("output") or "")
+            try:
+                payload = json.loads(raw_output)
+            except json.JSONDecodeError:
+                payload = None
+            direct_source = any(
+                marker in name for marker in ("http_get", "http_request", "browser_extract", "rag_read")
+            )
+            priority = 0 if direct_source else 1
+            candidates: list[dict[str, str]] = []
+            if payload is not None:
+                candidates = _citation_candidates(payload)
+                for candidate in candidates:
+                    add_source(
+                        candidate.get("url"),
+                        title=candidate.get("title"),
+                        excerpt=candidate.get("excerpt"),
+                        observed_at=tool.get("timestamp"),
+                        priority=priority,
+                    )
+            if not candidates:
+                fallback_excerpt = _clean_document_text(raw_output)
+                for match in SOURCE_URL.findall(raw_output):
+                    add_source(
+                        match,
+                        excerpt=fallback_excerpt,
+                        observed_at=tool.get("timestamp"),
+                        priority=priority,
+                    )
+
+    summary_text = str(summary or "")
+    for match in SOURCE_URL.findall(summary_text):
+        url = _safe_source_url(match)
+        if url and url not in sources:
+            add_source(url, excerpt=_summary_source_excerpt(summary_text, match), priority=0)
+
+    return [
+        {"id": index, **{key: value for key, value in source.items() if key != "_priority"}}
+        for index, source in enumerate(
+            sorted(sources.values(), key=lambda item: item["_priority"])[:8],
+            start=1,
+        )
+    ]
+
+
+def _citation_candidates(value: Any) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    if isinstance(value, list):
+        for item in value:
+            candidates.extend(_citation_candidates(item))
+        return candidates
+    if not isinstance(value, dict):
+        return candidates
+    raw_url = next(
+        (value.get(key) for key in ("url", "source_url", "page_url", "link") if value.get(key)),
+        None,
+    )
+    if raw_url:
+        title = next(
+            (value.get(key) for key in ("title", "name", "heading", "path") if value.get(key)),
+            "",
+        )
+        excerpt = next(
+            (
+                value.get(key)
+                for key in ("snippet", "excerpt", "description", "content", "text", "body")
+                if value.get(key)
+            ),
+            "",
+        )
+        candidates.append({"url": str(raw_url), "title": str(title), "excerpt": str(excerpt)})
+    for key in ("results", "sources", "documents", "citations", "items"):
+        if key in value:
+            candidates.extend(_citation_candidates(value[key]))
+    return candidates
+
+
+def _safe_source_url(value: Any) -> str:
+    raw = str(value or "").strip().rstrip(".,;:!?)]}，。；：！？）】")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urllib.parse.urlunsplit(parsed)
+
+
+def _clean_document_text(value: Any, *, limit: int = 620) -> str:
+    text = str(value or "")
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _source_date(value: str) -> str:
+    match = re.search(r"\b(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\b", value)
+    if not match:
+        return ""
+    return f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+
+
+def _summary_source_excerpt(summary: str, url: str) -> str:
+    index = summary.find(url)
+    if index < 0:
+        return ""
+    start = max(0, summary.rfind("\n", 0, index) + 1)
+    end = summary.find("\n", index)
+    return _clean_document_text(summary[start : len(summary) if end < 0 else end])
 
 
 def _conversation_records(store: RunStore, selected: RunRecord) -> list[RunRecord]:
@@ -543,6 +1267,17 @@ def _migrate_legacy_credentials(store: RunStore, state_dir: Path) -> None:
             store.save(record)
 
 
+def _recover_stale_runs(store: RunStore, manager: TaskManagerProtocol) -> None:
+    """Turn process-orphaned active records into explicit resumable checkpoints."""
+    for record in store.list():
+        if record.status not in ACTIVE_STATUSES or manager.status(record.run_id) is not None:
+            continue
+        record.status = RunStatus.INTERRUPTED
+        record.error = "LightWorker service restarted; this task can be resumed from its durable workspace."
+        record.current_step = None
+        store.save(record)
+
+
 def _root_run_id(record: RunRecord) -> str:
     task_spec = record.metadata.get("task_spec")
     if isinstance(task_spec, dict) and task_spec.get("root_run_id"):
@@ -557,18 +1292,47 @@ def _parent_run_id(record: RunRecord) -> str | None:
     return None
 
 
-def _build_conversation_context(store: RunStore, records: list[RunRecord]) -> str:
-    lines = [f"原始目标 / Original goal:\n{records[0].task}", "此前轮次 / Previous turns:"]
-    for index, record in enumerate(records[-4:], start=max(1, len(records) - 3)):
-        result = _read_optional_text(store, record.run_id, "summary.md") or record.error or "无可用总结"
-        lines.extend(
-            [
-                f"\n[Turn {index}] 用户 / User:\n{record.task}",
-                f"[Turn {index}] LightWorker:\n{result[:4000]}",
-            ]
-        )
-    text = "\n".join(lines)
-    return text if len(text) <= 14_000 else text[:2000] + "\n…\n" + text[-12_000:]
+def _scope_for_record(store: RunStore, record: RunRecord) -> str:
+    root_id = _root_run_id(record)
+    try:
+        root_repo = store.load(root_id).repo
+    except (FileNotFoundError, ValueError):
+        root_repo = record.repo
+    return workspace_scope(root_repo)
+
+
+def _build_conversation_context(
+    store: RunStore,
+    records: list[RunRecord],
+    settings: WorkerConfig,
+) -> str:
+    turns = [
+        {
+            "user": record.task,
+            "assistant": _read_optional_text(store, record.run_id, "summary.md")
+            or record.error
+            or "无可用总结",
+        }
+        for record in records
+    ]
+    decisions: list[str] = []
+    for record in records:
+        approvals = _read_optional_json(store, record.run_id, "approvals.json")
+        if not isinstance(approvals, dict):
+            continue
+        for value in (approvals.get("decisions") or {}).values():
+            if isinstance(value, dict):
+                decisions.append(f"approval={value.get('decision')} note={value.get('note') or ''}".strip())
+    result = ContextCompressor(
+        context_window_tokens=settings.runtime.context_window_tokens,
+        compression_ratio=settings.runtime.compression_ratio,
+    ).compress_turns(
+        turns,
+        objective=records[0].task,
+        acceptance_criteria=["Continue the original task using all relevant user-provided materials."],
+        decisions=decisions,
+    )
+    return result.text
 
 
 def _source_mode(record: RunRecord) -> str:
@@ -706,6 +1470,148 @@ def _load_activity(flow_record: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return activity
+
+
+def _agentic_steps(events: list[dict[str, Any]], record: RunRecord) -> list[dict[str, Any]]:
+    if not events and record.status == RunStatus.CREATED:
+        return []
+    started = next((item for item in events if item.get("type") == "agentic_run_started"), None)
+    ended = next((item for item in reversed(events) if item.get("type") == "agentic_run_completed"), None)
+    status_value = (
+        "waiting_approval"
+        if record.status == RunStatus.WAITING_APPROVAL
+        else "running"
+        if record.status in ACTIVE_STATUSES
+        else "success"
+        if record.status == RunStatus.SUCCEEDED
+        else "failed"
+    )
+    return [
+        {
+            "name": "agentic_loop",
+            "status": status_value,
+            "duration_ms": None,
+            "error": record.error,
+            "started_at": started.get("timestamp") if started else record.created_at.isoformat(),
+            "ended_at": ended.get("timestamp") if ended else None,
+        }
+    ]
+
+
+def _agentic_activity(events: list[dict[str, Any]], record: RunRecord) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    tools: list[dict[str, Any]] = []
+    notices: list[dict[str, str]] = []
+    verification: list[dict[str, Any]] = []
+    for event in events:
+        event_type = str(event.get("type") or "")
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        if event_type == "tool_started":
+            tools.append(
+                {
+                    "name": str(data.get("tool") or "tool"),
+                    "arguments": _display_value(data.get("arguments"), limit=1600),
+                    "output": None,
+                    "latency_ms": None,
+                    "timestamp": event.get("timestamp"),
+                }
+            )
+        elif event_type in {"tool_completed", "tool_failed", "tool_blocked"}:
+            name = str(data.get("tool") or "tool")
+            target = next(
+                (item for item in reversed(tools) if item["name"] == name and item["output"] is None),
+                None,
+            )
+            if target is None:
+                target = {
+                    "name": name,
+                    "arguments": "",
+                    "output": None,
+                    "latency_ms": None,
+                    "timestamp": event.get("timestamp"),
+                }
+                tools.append(target)
+            target["output"] = _display_value(
+                data.get("output") or data.get("error") or data.get("reason"),
+                limit=4000,
+            )
+        elif event_type == "verification_completed":
+            verification = list(data.get("results") or [])
+        elif event_type in {
+            "approval_requested",
+            "approval_decided",
+            "subagent_started",
+            "subagent_completed",
+            "budget_exceeded",
+            "steering_received",
+            "steering_consumed",
+            "pause_requested",
+            "cancel_requested",
+        }:
+            notices.append({"type": event_type, "message": _display_value(data, limit=1200)})
+    status_value = (
+        "waiting_approval"
+        if record.status == RunStatus.WAITING_APPROVAL
+        else "running"
+        if record.status in ACTIVE_STATUSES
+        else "success"
+        if record.status == RunStatus.SUCCEEDED
+        else "failed"
+    )
+    activity = [
+        {
+            "name": "agentic_loop",
+            "status": status_value,
+            "duration_ms": None,
+            "started_at": events[0].get("timestamp"),
+            "ended_at": events[-1].get("timestamp") if status_value != "running" else None,
+            "error": record.error,
+            "output": "",
+            "tools": tools,
+            "notices": notices,
+            "model_calls": 0,
+            "usage": {},
+            "verification_passed": None,
+        }
+    ]
+    if verification:
+        activity.append(
+            {
+                "name": "verify_0",
+                "status": "success",
+                "duration_ms": sum(float(item.get("duration_ms") or 0) for item in verification),
+                "started_at": None,
+                "ended_at": None,
+                "error": "",
+                "output": json.dumps({"configured": True, "results": verification}, ensure_ascii=False),
+                "tools": [],
+                "notices": [],
+                "model_calls": 0,
+                "usage": {},
+                "verification_passed": all(
+                    bool(item.get("passed")) or not bool(item.get("required", True)) for item in verification
+                ),
+            }
+        )
+    return activity
+
+
+def _pending_tool_approval(store: RunStore, run_id: str) -> dict[str, Any] | None:
+    pending = ApprovalBroker(store, run_id).pending()
+    if not pending:
+        return None
+    request = pending[0]
+    return {
+        "request_id": request["request_id"],
+        "step": request["request_id"],
+        "title": "工具操作需要确认",
+        "description": f"{request['tool']}: {request['reason']}",
+        "requested_action": _display_value(
+            {"tool": request["tool"], "arguments": request.get("arguments") or {}},
+            limit=1600,
+        ),
+    }
 
 
 def _pending_approval(flow_record: dict[str, Any]) -> dict[str, Any] | None:

@@ -12,7 +12,7 @@ from lightworker.cli import app, autodetect_verification
 def test_version_flag_works_without_command():
     result = CliRunner().invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "LightWorker 0.1.0" in result.stdout
+    assert "LightWorker 0.4.0" in result.stdout
 
 
 def test_no_args_prints_help():

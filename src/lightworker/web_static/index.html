@@ -6,8 +6,9 @@
     <meta name="color-scheme" content="light" />
     <title>LightWorker</title>
     <meta name="description" content="以聊天方式提交并观察通用任务。" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260810-2" />
-    <script src="/static/app.js?v=20260810-2" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=20260811-6" />
+    <script src="/static/markdown.js?v=20260811-6" defer></script>
+    <script src="/static/app.js?v=20260811-6" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -17,6 +18,7 @@
             <span class="brand-mark">L</span>
             <span>LightWorker</span>
           </a>
+          <button class="icon-button desktop-sidebar-collapse" id="sidebarCollapseButton" type="button" aria-label="收起对话列表">收起</button>
           <button class="icon-button mobile-sidebar-close" id="sidebarCloseButton" type="button">关闭</button>
         </div>
 
@@ -46,13 +48,18 @@
 
       <main class="chat-shell">
         <header class="chat-header">
-          <button class="icon-button mobile-menu-button" id="sidebarOpenButton" type="button">任务</button>
-          <div class="chat-title">
-            <strong id="chatTitle">新任务</strong>
-            <span id="chatMeta">本机隔离执行</span>
+          <div class="header-main">
+            <button class="icon-button mobile-menu-button" id="sidebarOpenButton" type="button">任务</button>
+            <button class="icon-button desktop-sidebar-expand" id="sidebarExpandButton" type="button" aria-label="展开对话列表">对话</button>
+            <div class="chat-title">
+              <strong id="chatTitle">新任务</strong>
+              <span id="chatMeta">本机隔离执行</span>
+            </div>
           </div>
           <div class="header-actions">
             <span class="run-status is-hidden" id="runStatus">—</span>
+            <button class="quiet-button is-hidden" id="pauseButton" type="button">暂停</button>
+            <button class="quiet-button danger-text is-hidden" id="cancelButton" type="button">取消</button>
             <button class="quiet-button is-hidden" id="resumeButton" type="button">恢复</button>
             <button class="quiet-button is-hidden" id="rerunButton" type="button">重新验证</button>
           </div>
@@ -78,6 +85,7 @@
                 <div class="message-label">你</div>
                 <div class="user-prompt" id="userPrompt"></div>
                 <div class="message-meta" id="userPromptMeta"></div>
+                <div class="message-actions is-hidden" id="currentUserActions"></div>
               </div>
             </article>
 
@@ -85,14 +93,41 @@
               <div class="message-avatar assistant-avatar">L</div>
               <div class="message-body">
                 <div class="message-label">LightWorker</div>
-                <div class="assistant-intro" id="assistantIntro">正在准备隔离工作区…</div>
-                <div class="activity-list" id="activityList"></div>
-                <div class="verification-card is-hidden" id="verificationCard"></div>
-                <section class="answer-block is-hidden" id="summaryBlock">
-                  <div class="answer-heading">
-                    <strong>任务总结</strong>
-                    <button class="text-button" type="button" data-copy-target="summaryContent">复制</button>
+                <details class="process-panel" id="processPanel" open>
+                  <summary class="process-summary">
+                    <span class="process-summary-copy">
+                      <strong id="processLabel">处理中</strong>
+                      <span id="processDuration">0s</span>
+                    </span>
+                  </summary>
+                  <div class="process-content">
+                    <div class="assistant-intro" id="assistantIntro">正在准备隔离工作区…</div>
+                    <div class="activity-list" id="activityList"></div>
+                    <div class="runtime-inspector is-hidden" id="runtimeInspector">
+                      <details id="goalPanel">
+                        <summary>Goal 与预算</summary>
+                        <pre id="goalContent"></pre>
+                      </details>
+                      <details id="agentPanel">
+                        <summary>Agent 树</summary>
+                        <div id="agentTreeContent"></div>
+                      </details>
+                      <details id="browserPanel">
+                        <summary>浏览器截图</summary>
+                        <div class="browser-gallery" id="browserGallery"></div>
+                      </details>
+                      <details id="resourcesPanel">
+                        <summary>Memory · Skills · RAG · MCP</summary>
+                        <div class="resource-manager" id="resourcesContent">
+                          <button class="text-button" id="loadResourcesButton" type="button">加载资源</button>
+                        </div>
+                      </details>
+                    </div>
+                    <div class="verification-card is-hidden" id="verificationCard"></div>
+                    <div class="run-error is-hidden" id="runError"></div>
                   </div>
+                </details>
+                <section class="answer-block final-answer is-hidden" id="summaryBlock">
                   <div class="markdown-text" id="summaryContent"></div>
                 </section>
                 <section class="diff-block is-hidden" id="diffBlock">
@@ -105,13 +140,21 @@
                   </div>
                   <pre id="diffContent"></pre>
                 </section>
-                <div class="run-error is-hidden" id="runError"></div>
+                <div class="message-actions is-hidden" id="currentAssistantActions"></div>
               </div>
             </article>
           </div>
         </section>
 
         <section class="composer-wrap">
+          <section class="message-queue is-hidden" id="messageQueuePanel" aria-live="polite">
+            <div class="message-queue-heading">
+              <strong>排队任务</strong>
+              <span id="messageQueueCount">0 条等待</span>
+            </div>
+            <div class="message-queue-list" id="messageQueueList"></div>
+          </section>
+          <div class="process-progress is-hidden" id="processProgress" aria-live="polite"></div>
           <form class="composer" id="taskForm">
             <textarea
               id="taskInput"
@@ -138,13 +181,30 @@
                 </div>
                 <button class="settings-button" id="settingsButton" type="button" aria-expanded="false">运行设置</button>
               </div>
-              <button class="send-button" id="submitTaskButton" type="submit">提交</button>
+              <div class="composer-context is-hidden" id="composerContext">沿用当前工作区</div>
+              <div class="composer-actions">
+                <span class="composer-model" id="composerModel">正在连接模型…</span>
+                <button class="stop-button is-hidden" id="composerStopButton" type="button">停止</button>
+                <button class="send-button" id="submitTaskButton" type="submit">提交</button>
+              </div>
             </div>
             <div class="repo-row is-hidden" id="repoRow">
               <label for="repoInput">仓库绝对路径</label>
               <input id="repoInput" name="repo" placeholder="/Users/you/projects/example" autocomplete="off" />
             </div>
             <div class="settings-panel is-hidden" id="settingsPanel">
+              <label>
+                <span>运行模式</span>
+                <select id="runtimeModeInput">
+                  <option value="agentic" selected>动态 Agentic Loop</option>
+                  <option value="workflow">固定 Workflow</option>
+                </select>
+                <small>同一入口支持任意任务；Workflow 仅用于需要固定阶段的场景</small>
+              </label>
+              <label class="checkbox-row">
+                <input id="goalModeInput" type="checkbox" checked />
+                <span>启用 Goal 长任务状态与预算</span>
+              </label>
               <label>
                 <span>测试命令</span>
                 <input id="testInput" value="pytest -q" placeholder="pytest -q" autocomplete="off" />
@@ -193,6 +253,16 @@
         </div>
       </form>
     </dialog>
+
+    <aside class="citation-popover is-hidden" id="citationPopover" role="dialog" aria-labelledby="citationTitle">
+      <div class="citation-popover-heading">
+        <span id="citationMeta">引用来源</span>
+        <button class="text-button" id="citationCloseButton" type="button">关闭</button>
+      </div>
+      <strong id="citationTitle">引用文档</strong>
+      <p id="citationExcerpt"></p>
+      <a id="citationLink" href="#" target="_blank" rel="noopener noreferrer">打开原文</a>
+    </aside>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
   </body>

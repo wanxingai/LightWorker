@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .agentic import AgenticRuntime
 from .agents import AgentFactory, StructuredOutputAgent, VerificationAdapter, parse_json_model
 from .analysis_tools import AnalysisTools, CredentialVault, sanitize_and_capture_credentials
 from .config import WorkerConfig
@@ -16,13 +17,16 @@ from .models import (
     ReviewReport,
     RunRecord,
     RunStatus,
+    RuntimeMode,
     TaskSpec,
     VerificationResult,
 )
 from .policy import redact_value
 from .repo_tools import RepositoryTools, update_install_record
-from .sandbox import DockerSandbox, SandboxBackend, SandboxError
+from .resources import resource_pool
+from .sandbox import DockerSandbox, ReadOnlyWorkspaceSandbox, SandboxBackend, SandboxError
 from .storage import RunStore
+from .tool_protocol import ApprovalBroker, EventLog
 from .workspace import WorkspaceManager
 
 try:
@@ -44,7 +48,11 @@ class CodingTaskRunner:
     ):
         self.config = config
         self.store = RunStore(config.state_dir)
-        self.agent_factory = agent_factory or AgentFactory(config.model)
+        self.agent_factory = agent_factory or AgentFactory(
+            config.model,
+            state_dir=config.state_dir,
+            runtime=config.runtime,
+        )
         self.sandbox_factory = sandbox_factory
         self.workspace_manager = workspace_manager or WorkspaceManager()
 
@@ -128,12 +136,20 @@ class CodingTaskRunner:
         rerun_step: str | None = None,
         approval: tuple[str, str, str] | None = None,
     ) -> RunRecord:
-        if LightFlow is None or JsonLightFlowStore is None:
-            raise RuntimeError("LightAgent LightFlow API is unavailable")
         workspace = Path(record.workspace or self.store.workspace_dir(spec.run_id)).resolve()
         image = spec.image or self.config.image
-        self._ensure_image(image)
-        sandbox = self.sandbox_factory(
+        use_agentic = spec.runtime_mode == RuntimeMode.AGENTIC and hasattr(self.agent_factory, "worker")
+        sandbox_factory = self.sandbox_factory
+        degraded_reason: str | None = None
+        if sandbox_factory is DockerSandbox and use_agentic and not DockerSandbox.daemon_available():
+            sandbox_factory = ReadOnlyWorkspaceSandbox
+            degraded_reason = (
+                "Docker is unavailable; host shell and workspace writes are disabled, "
+                "while read-only analysis capabilities remain available."
+            )
+        else:
+            self._ensure_image(image)
+        sandbox = sandbox_factory(
             run_id=spec.run_id,
             workspace=workspace,
             image=image,
@@ -142,11 +158,16 @@ class CodingTaskRunner:
             pip_index_url=self.config.pip_index_url,
             max_pip_requirements=self.config.max_pip_requirements,
             sensitive_read_patterns=self.config.sensitive_read_patterns,
+            shell_allowed_programs=self.config.shell.allowed_programs,
+            max_shell_argv_items=self.config.shell.max_argv_items,
         )
+        container_slot = resource_pool(self.config.state_dir, self.config.scheduler).container
+        if not container_slot.acquire(timeout=self.config.limits.command_timeout_seconds):
+            raise SandboxError("timed out waiting for an available task container slot")
         self.store.update_status(spec.run_id, RunStatus.RUNNING, current_step="sandbox")
         try:
             sandbox.start()
-            if resume or rerun_step:
+            if (resume or rerun_step) and getattr(sandbox, "supports_shell", True):
                 self._replay_dependencies(sandbox, record)
             tools = RepositoryTools(
                 sandbox=sandbox,
@@ -165,8 +186,36 @@ class CodingTaskRunner:
                     vault=CredentialVault(self.config.state_dir),
                 ).tools
             record = self.store.load(spec.run_id)
-            record.metadata["execution_mode"] = "unified"
+            record.metadata["execution_mode"] = (
+                "agentic"
+                if use_agentic
+                else "workflow"
+                if spec.runtime_mode == RuntimeMode.WORKFLOW
+                else "unified"
+            )
+            if degraded_reason:
+                record.metadata["degraded_mode"] = degraded_reason
             self.store.save(record)
+            if use_agentic:
+                if approval:
+                    request_id, action, note = approval
+                    ApprovalBroker(
+                        self.store,
+                        spec.run_id,
+                        EventLog(self.store, spec.run_id),
+                    ).decide(request_id, action, note)
+                return AgenticRuntime(
+                    config=self.config,
+                    store=self.store,
+                    spec=spec,
+                    record=record,
+                    sandbox=sandbox,
+                    repo_tools=tools,
+                    external_tools=external_tool_list,
+                    agent_factory=self.agent_factory,
+                ).run()
+            if LightFlow is None or JsonLightFlowStore is None:
+                raise RuntimeError("LightAgent LightFlow API is unavailable")
             flow = self._build_flow(spec, tools, external_tool_list)
             if approval:
                 step_name, action, note = approval
@@ -212,6 +261,7 @@ class CodingTaskRunner:
             return self._finalize(spec, tools, result)
         finally:
             sandbox.stop()
+            container_slot.release()
 
     def _prepare_spec(self, spec: TaskSpec) -> TaskSpec:
         sanitized, credentials = sanitize_and_capture_credentials(

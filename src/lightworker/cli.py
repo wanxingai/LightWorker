@@ -21,7 +21,10 @@ from .workflow import CodingTaskRunner
 
 app = typer.Typer(
     name="lightworker",
-    help="能力驱动、可审计、Docker 隔离的 LightAgent 通用任务 Worker / Capability-routed, auditable, Docker-isolated task worker.",
+    help=(
+        "能力驱动、可审计、Docker 隔离的 LightAgent 通用任务 Worker / "
+        "Capability-routed, auditable, Docker-isolated task worker."
+    ),
     no_args_is_help=False,
     invoke_without_command=True,
 )
@@ -162,6 +165,7 @@ def run_task(
         verification=verification,
         max_repairs=settings.max_repairs,
         image=settings.image,
+        runtime_mode=settings.runtime.mode,
     )
     console.print(Panel.fit(f"Run: [bold]{spec.run_id}[/bold]\nTask / 任务: {task}", title="LightWorker"))
     runner = CodingTaskRunner(settings)
@@ -309,6 +313,7 @@ def benchmark(
             ],
             max_repairs=settings.max_repairs,
             image=settings.image,
+            runtime_mode=settings.runtime.mode,
         )
         console.print(Panel.fit(f"Live benchmark: [bold]{selected.case_id}[/bold]", title="LightWorker"))
         runner = CodingTaskRunner(settings)

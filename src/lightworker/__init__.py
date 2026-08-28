@@ -18,4 +18,4 @@ __all__ = [
     "WorkerConfig",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"
