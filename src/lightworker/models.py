@@ -121,6 +121,7 @@ class TaskSpec(BaseModel):
     source_mode: Literal["existing", "empty"] = "existing"
     parent_run_id: str | None = None
     root_run_id: str | None = None
+    queue_item_id: str | None = None
     conversation_context: str | None = None
     runtime_mode: RuntimeMode = RuntimeMode.AGENTIC
     goal_mode: bool = True

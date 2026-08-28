@@ -4,18 +4,30 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from .config import ModelConfig
+from .config import ModelConfig, RuntimeConfig
 from .policy import make_policy_hooks
 
 try:
-    from LightAgent import LightAgent, RunResult
+    from LightAgent import (
+        BudgetLimits,
+        ContextBudget,
+        ContextCompactor,
+        LightAgent,
+        RunResult,
+        SqliteSessionStore,
+    )
 except ImportError:  # pragma: no cover
+    BudgetLimits = None  # type: ignore[assignment]
+    ContextBudget = None  # type: ignore[assignment]
+    ContextCompactor = None  # type: ignore[assignment]
     LightAgent = None  # type: ignore[assignment]
     RunResult = None  # type: ignore[assignment]
+    SqliteSessionStore = None  # type: ignore[assignment]
 
 
 PLANNER_INSTRUCTIONS = """
@@ -122,8 +134,33 @@ SPECIALIST_INSTRUCTIONS = {
 
 
 class AgentFactory:
-    def __init__(self, model: ModelConfig):
+    def __init__(
+        self,
+        model: ModelConfig,
+        *,
+        state_dir: Path | None = None,
+        runtime: RuntimeConfig | None = None,
+    ):
         self.model = model
+        self.runtime = runtime or RuntimeConfig()
+        goal_budget = self.runtime.goal_budget
+        self.budget_limits = (
+            BudgetLimits(
+                model_calls=goal_budget.max_model_calls,
+                tool_calls=goal_budget.max_tool_calls,
+                tokens=goal_budget.max_tokens,
+                seconds=goal_budget.max_seconds,
+            )
+            if BudgetLimits is not None
+            else None
+        )
+        self.session_store = None
+        if state_dir is not None:
+            if SqliteSessionStore is None:
+                raise RuntimeError("LightAgent Session API is unavailable; install LightAgent>=0.10,<0.16")
+            self.session_store = SqliteSessionStore(
+                state_dir.expanduser().resolve() / "lightagent-sessions.sqlite3"
+            )
 
     def planner(self, *, allowed_tools: set[str]) -> Any:
         return self._create("PlannerAgent", PLANNER_INSTRUCTIONS, allowed_tools)
@@ -173,6 +210,14 @@ class AgentFactory:
             raise RuntimeError("LightAgent is not installed")
         if not self.model.model:
             raise RuntimeError("LIGHTWORKER_MODEL is required for agent execution")
+        if any(value is None for value in (BudgetLimits, ContextBudget, ContextCompactor)):
+            raise RuntimeError(
+                "LightAgent unified runtime API is unavailable; install LightAgent>=0.10,<0.16"
+            )
+        # ContextBudget compacts when input exceeds max_tokens - reserved_output_tokens.
+        # Use the same threshold as the existing Web conversation compressor.
+        compression_threshold = int(self.runtime.context_window_tokens * self.runtime.compression_ratio)
+        reserved_output_tokens = self.runtime.context_window_tokens - compression_threshold
         return LightAgent(
             name=name,
             instructions=instructions,
@@ -186,6 +231,13 @@ class AgentFactory:
             self_learning=False,
             filter_tools=False,
             hooks=[*make_policy_hooks(allowed_tools=allowed_tools), *(extra_hooks or [])],
+            session_store=self.session_store,
+            budget_limits=self.budget_limits,
+            context_budget=ContextBudget(
+                max_tokens=self.runtime.context_window_tokens,
+                reserved_output_tokens=reserved_output_tokens,
+            ),
+            context_compactor=ContextCompactor(),
             debug=False,
         )
 

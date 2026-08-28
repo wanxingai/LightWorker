@@ -934,7 +934,7 @@ wheels = [
 
 [[package]]
 name = "lightagent"
-version = "0.9.7"
+version = "0.10.0"
 source = { editable = "../LightAgent" }
 dependencies = [
     { name = "colorama" },
@@ -970,7 +970,7 @@ provides-extras = ["litellm", "nos", "oss"]
 
 [[package]]
 name = "lightworker"
-version = "0.2.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

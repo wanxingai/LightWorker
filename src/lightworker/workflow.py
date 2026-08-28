@@ -48,7 +48,11 @@ class CodingTaskRunner:
     ):
         self.config = config
         self.store = RunStore(config.state_dir)
-        self.agent_factory = agent_factory or AgentFactory(config.model)
+        self.agent_factory = agent_factory or AgentFactory(
+            config.model,
+            state_dir=config.state_dir,
+            runtime=config.runtime,
+        )
         self.sandbox_factory = sandbox_factory
         self.workspace_manager = workspace_manager or WorkspaceManager()
 

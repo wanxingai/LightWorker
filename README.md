@@ -1,10 +1,27 @@
 # LightWorker
 
-LightWorker 是基于 LightAgent 0.9.7 的本地通用 Agent Worker。它不再把任务拆成“编码任务”和“通用任务”两个入口：检索、分析、写作、浏览器操作、RAG、Shell、代码修改和后续追问都可以在同一个动态 Agentic Loop 中按需组合。只有发生文件编辑时才展示 diff。
+LightWorker 是基于 LightAgent 统一运行时（当前兼容 `>=0.10,<0.16`）的本地通用 Agent Worker。它不再把任务拆成“编码任务”和“通用任务”两个入口：检索、分析、写作、浏览器操作、RAG、Shell、代码修改和后续追问都可以在同一个动态 Agentic Loop 中按需组合。只有发生文件编辑时才展示 diff。
 
-LightWorker is a local universal Agent Worker powered by LightAgent 0.9.7. Research, analysis, writing, browser automation, RAG, Docker shell, code changes, and follow-up messages share one dynamic Agentic Loop. A diff is shown only when files actually changed.
+LightWorker is a local universal Agent Worker powered by the LightAgent unified runtime (currently compatible with `>=0.10,<0.16`). Research, analysis, writing, browser automation, RAG, Docker shell, code changes, and follow-up messages share one dynamic Agentic Loop. A diff is shown only when files actually changed.
 
 Agentica 只作为能力设计参考，不是运行时依赖。核心模型循环、Trace、Hook、LightFlow 和 MCP 基础仍来自 LightAgent。
+
+## v0.4.0
+
+- 新增对话级 LightAgent 原生 Session：模型执行仍按 run 隔离，对话调度状态则统一写入 `lightworker-conversation-<root_run_id>`，避免重复注入模型历史。
+- 后续消息、排队领取、重试释放、完成和“引导”全部使用 append-only Session 事件；`AgentInbox.FOLLOWUP` 与 `AgentInbox.STEERING` 可从同一 Session 恢复。
+- `lightagent-sessions.sqlite3` 成为对话队列的唯一事实源；原有 `message-queue.json` 降级为可读兼容缓存，缓存损坏会由 Session 投影自动修复。
+- 自动迁移 v0.3 及更早版本的 JSON 队列，迁移过程和结果本身也会写入 Session 事件，保留审计证据。
+- 新增 `lightagent-conversation.json` 诊断工件和 Web `conversation_runtime` 摘要，公开原生 Session ID、事件数及 Inbox 状态。
+- 保持现有追问、排队、引导、SSE 和任务详情 API 兼容；不把整段对话 Session 直接复用为模型 Session，防止上下文双重回放。
+
+## v0.3.0
+
+- 使用 LightAgent SQLite Session 持久化主 Agent、修复轮次和子 Agent 的原生事件。
+- 将后续任务映射为原生 `AgentInbox.FOLLOWUP`，将实时“引导”映射为安全边界投递的 `AgentInbox.STEERING`。
+- 将 LightWorker 主 Goal 和成功、暂停、恢复、失败、预算受限、等待审批、取消状态同步到原生 `GoalManager` 与 Session 控制事件。
+- 每个任务生成脱敏的 `lightagent-session.json` 和 `lightagent-runtime.json`，后者包含 Session replay、Inbox、Goal 和 Budget 快照。
+- 保留现有 Web API、消息队列、审批与 EventLog 作为兼容视图；同步只发生在 Agent 安全边界或模型执行停止后，避免覆盖并发 Session 事件。
 
 ## 核心能力
 
@@ -31,7 +48,7 @@ Agentica 只作为能力设计参考，不是运行时依赖。核心模型循�
 Chat / CLI
     │
     ├─ Dynamic Agentic Loop (default)
-    │    ├─ Goal + WorkingMemory + automatic compression
+    │    ├─ LightAgent Session + Inbox + Goal + automatic compression
     │    ├─ Tool policy + exact approval + EventLog
     │    ├─ Web / Browser / RAG / Memory / Skills / MCP
     │    ├─ bounded parallel subagents
@@ -49,7 +66,7 @@ Docker 不可用时，动态运行时会安全降级为纯 Python 只读工作�
 
 ## 安装
 
-要求 Python 3.11、Git、Docker Desktop，以及相邻目录中的 LightAgent 0.9.7 源码：
+要求 Python 3.11、Git、Docker Desktop，以及相邻目录中的 LightAgent 统一运行时源码（`>=0.10,<0.16`）：
 
 ```text
 Langchain-Chatchat/

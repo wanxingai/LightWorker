@@ -52,6 +52,9 @@ ARTIFACTS = {
     "summary": ("summary.md", "text/markdown; charset=utf-8"),
     "diff": ("changes.patch", "text/x-diff; charset=utf-8"),
     "trace": ("trace.jsonl", "application/x-ndjson; charset=utf-8"),
+    "session": ("lightagent-session.json", "application/json; charset=utf-8"),
+    "runtime": ("lightagent-runtime.json", "application/json; charset=utf-8"),
+    "conversation": ("lightagent-conversation.json", "application/json; charset=utf-8"),
     "status": ("git-status.txt", "text/plain; charset=utf-8"),
 }
 ACTIVE_STATUSES = {RunStatus.CREATED, RunStatus.PREPARING, RunStatus.RUNNING}
@@ -255,6 +258,7 @@ def create_app(
         message: str,
         *,
         followup_id: str,
+        queue_item_id: str | None = None,
     ) -> TaskSpec:
         conversation = _conversation_records(store, selected)
         parent = conversation[-1]
@@ -289,6 +293,7 @@ def create_app(
             source_mode=parent_spec.source_mode,
             parent_run_id=parent.run_id,
             root_run_id=root.run_id,
+            queue_item_id=queue_item_id,
             conversation_context=_build_conversation_context(store, conversation, settings),
             runtime_mode=parent_spec.runtime_mode,
             goal_mode=parent_spec.goal_mode,
@@ -376,6 +381,7 @@ def create_app(
                     parent,
                     str(pending.get("message") or ""),
                     followup_id=followup_id,
+                    queue_item_id=str(pending["id"]),
                 )
             except ValueError as exc:
                 message_queue.complete(root_run_id, str(pending["id"]), error=str(exc))
@@ -465,8 +471,18 @@ def create_app(
         record = _load_record(store, run_id)
         root_run_id = _root_run_id(record)
         _dispatch_next_queued_message(root_run_id)
+        active_messages = message_queue.active(root_run_id)
+        native = message_queue.snapshot(root_run_id)
         payload = _run_detail(store, record, manager.status(run_id))
-        payload["message_queue"] = redact_value(message_queue.active(root_run_id))
+        payload["message_queue"] = redact_value(active_messages)
+        payload["conversation_runtime"] = redact_value(
+            {
+                "session_id": native["session"]["session_id"],
+                "source_of_truth": native["source_of_truth"],
+                "event_count": len(native["session"]["events"]),
+                "inbox": native["inbox"],
+            }
+        )
         return payload
 
     @app.get("/api/runs/{run_id}/events")
@@ -519,9 +535,11 @@ def create_app(
         root = conversation[0]
         parent_job = manager.status(parent.run_id)
         active_queue = message_queue.active(root.run_id)
-        if parent.status in QUEUE_BLOCKING_STATUSES or (
-            parent_job and parent_job.get("state") in {"queued", "running"}
-        ) or active_queue:
+        if (
+            parent.status in QUEUE_BLOCKING_STATUSES
+            or (parent_job and parent_job.get("state") in {"queued", "running"})
+            or active_queue
+        ):
             safe_message, credentials = sanitize_and_capture_credentials([payload.message])
             CredentialVault(settings.state_dir).merge(root.run_id, credentials)
             item = message_queue.enqueue(root.run_id, safe_message[0])
@@ -580,12 +598,13 @@ def create_app(
 
     @app.get("/api/runs/{run_id}/artifacts/{artifact}")
     def get_artifact(run_id: str, artifact: str) -> PlainTextResponse:
-        _load_record(store, run_id)
+        record = _load_record(store, run_id)
         if artifact not in ARTIFACTS:
             raise HTTPException(status_code=404, detail="unknown artifact")
         filename, media_type = ARTIFACTS[artifact]
+        artifact_run_id = _root_run_id(record) if artifact == "conversation" else run_id
         return PlainTextResponse(
-            _read_artifact(store, run_id, filename),
+            _read_artifact(store, artifact_run_id, filename),
             media_type=media_type,
             headers={"Cache-Control": "no-store"},
         )
@@ -1112,8 +1131,7 @@ def _extract_citations(activity: list[dict[str, Any]], summary: str | None) -> l
             except json.JSONDecodeError:
                 payload = None
             direct_source = any(
-                marker in name
-                for marker in ("http_get", "http_request", "browser_extract", "rag_read")
+                marker in name for marker in ("http_get", "http_request", "browser_extract", "rag_read")
             )
             priority = 0 if direct_source else 1
             candidates: list[dict[str, str]] = []

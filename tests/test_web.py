@@ -66,9 +66,7 @@ class DeferredManager:
         return self.states.get(run_id)
 
     def run_next(self) -> None:
-        run_id, action, function = next(
-            job for job in self.jobs if self.states[job[0]]["state"] == "queued"
-        )
+        run_id, action, function = next(job for job in self.jobs if self.states[job[0]]["state"] == "queued")
         self.states[run_id] = {"state": "running", "action": action, "error": None}
         function()
         self.states[run_id] = {"state": "completed", "action": action, "error": None}
@@ -141,7 +139,7 @@ def test_web_ui_bundles_safe_markdown_renderer(tmp_path: Path):
     assert page.status_code == 200
     assert renderer.status_code == 200
     assert app.status_code == 200
-    assert '/static/markdown.js' in page.text
+    assert "/static/markdown.js" in page.text
     assert "LightWorkerMarkdown" in renderer.text
     assert "escapeHtml" in renderer.text
     assert "safeHref" in renderer.text
@@ -227,7 +225,7 @@ def test_web_ui_exposes_running_followup_queue_and_guidance_controls(tmp_path: P
     assert "function renderMessageQueue" in app.text
     assert "function guideQueuedMessage" in app.text
     assert 'result.status === "followup_queued"' in app.text
-    assert 'busy && !hasInput' in app.text
+    assert "busy && !hasInput" in app.text
     assert 'textContent = "引导"' in app.text
     assert ".message-queue-item" in styles.text
     assert ".guide-button" in styles.text
@@ -749,6 +747,131 @@ def test_active_followups_queue_and_pending_message_can_guide_current_run(
     remaining = client.get("/api/runs/queue-root").json()["message_queue"]
     assert [item["message"] for item in remaining] == ["再分析价格"]
 
+    native = client.app.state.message_queue.snapshot("queue-root")
+    assert native["source_of_truth"] == "lightagent_session"
+    assert native["session"]["session_id"] == "lightworker-conversation-queue-root"
+    inbox = {item["message_id"]: item for item in native["inbox"]}
+    assert inbox[first.json()["queue_item"]["id"]]["status"] == "rejected"
+    assert inbox[f"steering-{first.json()['queue_item']['id']}"]["status"] == "completed"
+
+
+def test_native_conversation_session_is_authoritative_over_queue_cache(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    manager = DeferredManager()
+    client, config = make_client(tmp_path, manager)
+    store = RunStore(config.state_dir)
+    spec = TaskSpec(run_id="native-root", repo=git_repo, task="分析市场", source_mode="empty")
+    store.create(
+        RunRecord(
+            run_id=spec.run_id,
+            task=spec.task,
+            repo=str(git_repo),
+            workspace=str(git_repo),
+            status=RunStatus.RUNNING,
+            metadata={"task_spec": spec.model_dump(mode="json")},
+        )
+    )
+    queued = client.post(
+        "/api/runs/native-root/followups",
+        json={"message": "原生 Session 中的消息"},
+    ).json()["queue_item"]
+
+    store.write_json(
+        "native-root",
+        "message-queue.json",
+        [{"id": "corrupted", "message": "被改坏的缓存", "status": "pending"}],
+    )
+    detail = client.get("/api/runs/native-root").json()
+
+    assert [item["id"] for item in detail["message_queue"]] == [queued["id"]]
+    assert detail["conversation_runtime"]["source_of_truth"] == "lightagent_session"
+    cached = store.read_json("native-root", "message-queue.json")
+    assert [item["id"] for item in cached] == [queued["id"]]
+    snapshot = store.read_json("native-root", "lightagent-conversation.json")
+    assert snapshot["session_id"] == "lightworker-conversation-native-root"
+
+
+def test_legacy_queue_is_migrated_to_native_conversation_session(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    manager = DeferredManager()
+    client, config = make_client(tmp_path, manager)
+    store = RunStore(config.state_dir)
+    spec = TaskSpec(run_id="legacy-root", repo=git_repo, task="分析市场", source_mode="empty")
+    store.create(
+        RunRecord(
+            run_id=spec.run_id,
+            task=spec.task,
+            repo=str(git_repo),
+            workspace=str(git_repo),
+            status=RunStatus.RUNNING,
+            metadata={"task_spec": spec.model_dump(mode="json")},
+        )
+    )
+    store.write_json(
+        "legacy-root",
+        "message-queue.json",
+        [
+            {
+                "id": "legacy-message",
+                "message": "迁移这条旧消息",
+                "status": "pending",
+                "created_at": "2026-08-16T00:00:00+00:00",
+                "run_id": None,
+            }
+        ],
+    )
+
+    detail = client.get("/api/runs/legacy-root").json()
+    native = client.app.state.message_queue.snapshot("legacy-root")
+
+    assert [item["id"] for item in detail["message_queue"]] == ["legacy-message"]
+    event_types = [event["type"] for event in native["session"]["events"]]
+    assert "lightworker.queue.migration_started" in event_types
+    assert "lightworker.queue.migration_completed" in event_types
+    assert native["inbox"][0]["message_id"] == "legacy-message"
+
+
+def test_native_queue_retry_keeps_logical_order_and_inbox_history(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    client, config = make_client(tmp_path, DeferredManager())
+    store = RunStore(config.state_dir)
+    spec = TaskSpec(run_id="retry-root", repo=git_repo, task="执行任务", source_mode="empty")
+    store.create(
+        RunRecord(
+            run_id=spec.run_id,
+            task=spec.task,
+            repo=str(git_repo),
+            workspace=str(git_repo),
+            status=RunStatus.RUNNING,
+            metadata={"task_spec": spec.model_dump(mode="json")},
+        )
+    )
+    queue = client.app.state.message_queue
+    first = queue.enqueue("retry-root", "重试任务 A")
+    second = queue.enqueue("retry-root", "后续任务 B")
+
+    assert queue.claim("retry-root", first["id"], "attempt-one") is not None
+    queue.release("retry-root", first["id"], "worker temporarily unavailable")
+    assert queue.claim("retry-root", first["id"], "attempt-two") is not None
+    queue.complete("retry-root", first["id"])
+
+    projected = queue.all("retry-root")
+    assert [item["id"] for item in projected] == [first["id"], second["id"]]
+    assert [item["status"] for item in projected] == ["completed", "pending"]
+    native = queue.snapshot("retry-root")
+    attempts = [
+        message
+        for message in native["inbox"]
+        if message["metadata"].get("lightworker_queue_item_id") == first["id"]
+    ]
+    assert [message["status"] for message in attempts] == ["rejected", "completed"]
+
 
 def test_queued_followups_dispatch_sequentially_after_each_run_finishes(
     git_repo: Path,
@@ -798,6 +921,7 @@ def test_queued_followups_dispatch_sequentially_after_each_run_finishes(
 
     assert client.get("/api/runs/serial-root").json()["message_queue"] == []
     assert [spec.task for spec in QueueCompletingRunner.specs] == ["排队任务 A", "排队任务 B"]
+    assert all(spec.queue_item_id for spec in QueueCompletingRunner.specs)
 
 
 def test_run_list_groups_followups_and_detail_returns_conversation(

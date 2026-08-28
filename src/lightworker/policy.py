@@ -52,7 +52,7 @@ def redact_value(value: Any) -> Any:
 
 def make_policy_hooks(*, allowed_tools: set[str]) -> list[Any]:
     if PolicyHook is None or HookDecision is None:
-        raise RuntimeError("LightAgent policy API is unavailable; install LightAgent>=0.9.7,<0.10")
+        raise RuntimeError("LightAgent policy API is unavailable; install LightAgent>=0.10,<0.16")
 
     def authorize(ctx: Any) -> Any:
         if ctx.phase == "before_tool_call":
@@ -96,7 +96,7 @@ def make_policy_hooks(*, allowed_tools: set[str]) -> list[Any]:
 def make_runtime_hook(*, control: Any, goal: Any, events: Any) -> Any:
     """Create a fail-closed hook for pause/cancel, live steering, and goal budgets."""
     if PolicyHook is None or HookDecision is None:
-        raise RuntimeError("LightAgent policy API is unavailable; install LightAgent>=0.9.7,<0.10")
+        raise RuntimeError("LightAgent policy API is unavailable; install LightAgent>=0.10,<0.16")
 
     def runtime(ctx: Any) -> Any:
         if ctx.phase in {"before_model_request", "before_tool_call"}:
@@ -122,7 +122,7 @@ def make_runtime_hook(*, control: Any, goal: Any, events: Any) -> Any:
                     )
                 params["messages"] = messages
                 events.emit("steering_consumed", {"messages": steering})
-                return HookDecision.replace({"params": params})
+                return HookDecision.replace({"params": params, "lightworker_steering": steering})
         return None
 
     return PolicyHook(

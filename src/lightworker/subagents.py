@@ -162,6 +162,7 @@ class SubagentManager:
                 max_retry=4,
                 max_tool_iterations=4,
                 run_group_id=self.run_id,
+                session_id=self._session_id(agent_id),
             )
             trace = list(getattr(result, "trace", []) or [])
             self._save_trace(agent_id, result, attempt=1)
@@ -241,6 +242,7 @@ class SubagentManager:
                 max_tool_iterations=2,
                 run_group_id=self.run_id,
                 parent_trace_id=getattr(failed_result, "trace_id", None),
+                session_id=self._session_id(agent_id),
                 use_skills=False,
             )
             self._save_trace(agent_id, recovered, attempt=2)
@@ -259,6 +261,9 @@ class SubagentManager:
                 {"agent_id": agent_id, "role": role, "valid": False, "error": error},
             )
             return None, f"subagent synthesis recovery failed: {error}"
+
+    def _session_id(self, agent_id: str) -> str:
+        return f"{self.run_id}-subagent-{agent_id}"
 
     def _save_trace(self, agent_id: str, result: Any, *, attempt: int) -> None:
         events = list(getattr(result, "trace", []) or [])

@@ -4,14 +4,16 @@ import asyncio
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from LightAgent import RunResult
 
 import lightworker.browser_tools as browser_module
+from lightworker.agents import AgentFactory
 from lightworker.browser_tools import BrowserTools
-from lightworker.config import BrowserConfig, RAGConfig, SkillsConfig, WorkerConfig
+from lightworker.config import BrowserConfig, ModelConfig, RAGConfig, SkillsConfig, WorkerConfig
 from lightworker.context import ContextCompressor
 from lightworker.memory import WorkspaceMemory
 from lightworker.models import RunRecord, RunStatus, TaskSpec, VerificationCommand
@@ -95,9 +97,10 @@ class DynamicAgent:
         self.behavior = behavior
 
     def run(self, query: str, **kwargs: Any) -> RunResult:
-        # LightAgent 0.9.7 treats run(metadata=...) as raw chat-completion
-        # parameters, so LightWorker runtime identifiers must never be sent there.
+        # LightAgent currently copies run(metadata=...) into provider parameters,
+        # so LightWorker runtime identifiers must remain in Session/run fields.
         assert "metadata" not in kwargs
+        assert kwargs.get("session_id")
         tools = {tool.tool_info["tool_name"]: tool for tool in kwargs.get("tools", [])}
         if self.behavior == "patch":
             tools["apply_patch"](patch=PATCH)
@@ -119,6 +122,35 @@ class DynamicFactory:
 
     def specialist(self, role: str, **kwargs: Any) -> DynamicAgent:
         return DynamicAgent("answer")
+
+
+class SessionExportingAgent(DynamicAgent):
+    def export_session(self, session_id: str) -> dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "metadata": {},
+            "events": [{"sequence": 1, "type": "session.started"}],
+        }
+
+
+class SessionExportingFactory(DynamicFactory):
+    def worker(self, **kwargs: Any) -> SessionExportingAgent:
+        return SessionExportingAgent(self.behavior)
+
+
+class NativeSessionFactory(AgentFactory):
+    def worker(self, **kwargs: Any) -> Any:
+        agent = super().worker(**kwargs)
+
+        class StaticCompletions:
+            def create(self, **request: Any) -> Any:
+                del request
+                message = SimpleNamespace(content="原生运行时任务完成", tool_calls=None)
+                usage = SimpleNamespace(prompt_tokens=2, completion_tokens=1, total_tokens=3)
+                return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+
+        agent.client = SimpleNamespace(chat=SimpleNamespace(completions=StaticCompletions()))
+        return agent
 
 
 class RecoveringFactory(DynamicFactory):
@@ -228,6 +260,60 @@ def test_agentic_runtime_combines_patch_verification_goal_and_events(git_repo: P
     assert "tool_started" in events
     assert "verification_completed" in events
     assert "agentic_run_completed" in events
+
+
+def test_agentic_runtime_exports_native_lightagent_session(git_repo: Path, tmp_path: Path):
+    runner = CodingTaskRunner(
+        agentic_config(tmp_path),
+        agent_factory=SessionExportingFactory("answer"),
+        sandbox_factory=AgenticSandbox,
+    )
+    spec = TaskSpec(repo=git_repo, task="分析资料")
+
+    record = runner.run(spec)
+
+    assert record.status == RunStatus.SUCCEEDED
+    assert record.metadata["lightagent_session_id"] == spec.run_id
+    session = runner.store.read_json(spec.run_id, "lightagent-session.json")
+    assert session["session_id"] == spec.run_id
+    assert session["events"][0]["type"] == "session.started"
+    events = runner.store.artifact_path(spec.run_id, "events.jsonl").read_text()
+    assert "lightagent_session_exported" in events
+
+
+def test_agentic_runtime_synchronizes_native_goal_and_followup_inbox(
+    git_repo: Path,
+    tmp_path: Path,
+):
+    config = agentic_config(tmp_path)
+    factory = NativeSessionFactory(
+        ModelConfig(model="fake-model", api_key="test-key"),
+        state_dir=config.state_dir,
+        runtime=config.runtime,
+    )
+    runner = CodingTaskRunner(
+        config,
+        agent_factory=factory,
+        sandbox_factory=AgenticSandbox,
+    )
+    spec = TaskSpec(
+        repo=git_repo,
+        task="继续分析资料",
+        parent_run_id="root-run",
+        root_run_id="root-run",
+        queue_item_id="queued-message",
+    )
+
+    record = runner.run(spec)
+
+    assert record.status == RunStatus.SUCCEEDED
+    runtime = runner.store.read_json(spec.run_id, "lightagent-runtime.json")
+    assert runtime["goals"][0]["status"] == "completed"
+    assert runtime["inbox"][0]["message_id"] == "queued-message"
+    assert runtime["inbox"][0]["status"] == "completed"
+    assert runtime["budget"]["usage"]["model_calls"] == 1
+    events = runner.store.artifact_path(spec.run_id, "events.jsonl").read_text()
+    assert "lightagent_runtime_synchronized" in events
 
 
 def test_exact_shell_approval_is_durable_and_resumable(git_repo: Path, tmp_path: Path):

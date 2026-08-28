@@ -14,6 +14,7 @@ from .goals import GoalManager, GoalTools
 from .mcp_tools import MCPToolProvider
 from .memory import AgentsInstructions, MemoryTools, WorkingMemory, WorkspaceMemory, workspace_scope
 from .models import GoalStatus, RunRecord, RunStatus, TaskSpec, VerificationResult
+from .native_runtime import NativeRuntimeLifecycle
 from .policy import make_runtime_hook, redact_value
 from .rag import RAGIndex, RAGTools
 from .repo_tools import RepositoryTools
@@ -52,9 +53,12 @@ class AgenticRuntime:
         self.goal = GoalManager(store, spec.run_id)
         self.resources = resource_pool(config.state_dir, config.scheduler)
         self.browser: BrowserTools | None = None
+        self.native_lifecycle: NativeRuntimeLifecycle | None = None
 
     def run(self) -> RunRecord:
         started = time.perf_counter()
+        self.record.metadata["lightagent_session_id"] = self._session_id()
+        self.store.save(self.record)
         goal = self.goal.create(
             self.spec.task,
             acceptance_criteria=["Complete the user's requested outcome with tool-grounded evidence."],
@@ -72,8 +76,26 @@ class AgenticRuntime:
         )
         wrapped_tools, catalog, skill_registry, mcp_errors = self._build_tools()
         names = {str(tool.tool_info["tool_name"]) for tool in wrapped_tools}
-        runtime_hook = make_runtime_hook(control=self.control, goal=self.goal, events=self.events)
-        worker = self.agent_factory.worker(allowed_tools=names, extra_hooks=[runtime_hook])
+        self.native_lifecycle = NativeRuntimeLifecycle(
+            session_id=self._session_id(),
+            run_id=self.spec.run_id,
+            objective=self.spec.task,
+            acceptance_criteria=goal.acceptance_criteria,
+            parent_run_id=self.spec.parent_run_id,
+            root_run_id=self.spec.root_run_id,
+            queue_item_id=self.spec.queue_item_id,
+            local_goal_id=goal.goal_id,
+        )
+        runtime_hook = make_runtime_hook(
+            control=self.control,
+            goal=self.goal,
+            events=self.events,
+        )
+        worker = self.agent_factory.worker(
+            allowed_tools=names,
+            extra_hooks=[runtime_hook, self.native_lifecycle.hook()],
+        )
+        self.native_lifecycle.bind(worker)
         limit_agent_model_calls(worker, self.resources.model)
         query = self._prompt(skill_registry, mcp_errors)
         self.store.write_json(
@@ -94,12 +116,13 @@ class AgenticRuntime:
                 max_tool_iterations=self.config.runtime.max_tool_iterations,
                 user_id=self._memory_scope(),
                 run_group_id=self.spec.root_run_id or self.spec.run_id,
+                session_id=self._session_id(),
                 use_skills=False,
             )
             self._save_trace(result)
             self._record_usage(result, catalog, time.perf_counter() - started)
             if self.approvals.pending():
-                return self._waiting_for_approval(result)
+                return self._sync_native_runtime(self._waiting_for_approval(result))
             budget = self.goal.exceeded_budget()
             if (
                 self._result_failed(result)
@@ -112,10 +135,11 @@ class AgenticRuntime:
             if diff.strip():
                 verification = self._verify_and_repair(worker, wrapped_tools, catalog, result)
                 if self.approvals.pending():
-                    return self._waiting_for_approval(result)
+                    return self._sync_native_runtime(self._waiting_for_approval(result))
                 diff = self.repo_tools.full_diff()
-            return self._finalize(result, diff, verification)
+            return self._sync_native_runtime(self._finalize(result, diff, verification))
         finally:
+            self._persist_lightagent_session(worker)
             if self.browser is not None:
                 self.browser.close()
 
@@ -270,6 +294,7 @@ class AgenticRuntime:
                 max_tool_iterations=self.config.runtime.max_tool_iterations,
                 user_id=self._memory_scope(),
                 run_group_id=self.spec.root_run_id or self.spec.run_id,
+                session_id=self._session_id(),
                 use_skills=False,
             )
             self._append_trace(result)
@@ -332,6 +357,7 @@ class AgenticRuntime:
             max_tool_iterations=2,
             user_id=self._memory_scope(),
             run_group_id=self.spec.root_run_id or self.spec.run_id,
+            session_id=self._session_id(),
             use_skills=False,
         )
         self._append_trace(recovered)
@@ -563,6 +589,77 @@ class AgenticRuntime:
         lines = [json.dumps(redact_value(event), ensure_ascii=False, default=str) for event in events]
         if lines:
             self.store.append_text(self.spec.run_id, "trace.jsonl", "\n".join(lines) + "\n")
+
+    def _persist_lightagent_session(self, worker: Any) -> None:
+        """Project the native durable Session into the per-run artifact directory for inspection."""
+        export = getattr(worker, "export_session", None)
+        if not callable(export):
+            return
+        session_id = self._session_id()
+        try:
+            payload = export(session_id)
+            if not isinstance(payload, dict):
+                return
+            self.store.write_json(
+                self.spec.run_id,
+                "lightagent-session.json",
+                redact_value(payload),
+            )
+        except Exception as exc:  # noqa: BLE001 - session projection must not mask the task result
+            self.events.emit(
+                "lightagent_session_export_failed",
+                {"session_id": session_id, "error": redact_value(str(exc))},
+            )
+            return
+        events = payload.get("events")
+        self.events.emit(
+            "lightagent_session_exported",
+            {
+                "session_id": session_id,
+                "event_count": len(events) if isinstance(events, list) else 0,
+            },
+        )
+
+    def _sync_native_runtime(self, record: RunRecord) -> RunRecord:
+        lifecycle = self.native_lifecycle
+        session_store = getattr(self.agent_factory, "session_store", None)
+        if lifecycle is None or session_store is None:
+            return record
+        try:
+            snapshot = lifecycle.finalize(
+                session_store,
+                record.status,
+                record.error or "",
+                budget_limits=getattr(self.agent_factory, "budget_limits", None),
+            )
+            if snapshot is None:
+                return record
+            self.store.write_json(
+                self.spec.run_id,
+                "lightagent-runtime.json",
+                redact_value(snapshot),
+            )
+            self.events.emit(
+                "lightagent_runtime_synchronized",
+                {
+                    "session_id": self._session_id(),
+                    "status": record.status.value,
+                    "inbox_count": len(snapshot.get("inbox") or []),
+                    "goal_count": len(snapshot.get("goals") or []),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - native projection must not mask the task result
+            self.events.emit(
+                "lightagent_runtime_sync_failed",
+                {"session_id": self._session_id(), "error": redact_value(str(exc))},
+            )
+        return record
+
+    def _session_id(self) -> str:
+        # A task run owns one native Session. Follow-up runs retain their explicit
+        # conversation context until the Web queue is migrated to AgentInbox, so
+        # using the root ID here would replay the same history twice.
+        return self.spec.run_id
 
     def _memory_scope(self) -> str:
         root_id = self.spec.root_run_id or self.spec.run_id

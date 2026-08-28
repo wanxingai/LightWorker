@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 import shutil
 import subprocess
 import sys
@@ -91,9 +92,28 @@ def _lightagent_diagnostic() -> Diagnostic:
         module = importlib.import_module("LightAgent")
     except Exception as exc:
         return Diagnostic("LightAgent", False, f"import failed: {exc}")
-    required = ["LightAgent", "LightFlow", "JsonLightFlowStore", "PolicyHook", "RunResult"]
+    required = [
+        "LightAgent",
+        "LightFlow",
+        "JsonLightFlowStore",
+        "PolicyHook",
+        "RunResult",
+        "AgentRuntime",
+        "AgentInbox",
+        "BudgetLimits",
+        "CapabilityRegistry",
+        "ContextBudget",
+        "ContextCompactor",
+        "SqliteSessionStore",
+    ]
     missing = [name for name in required if not hasattr(module, name)]
     version = str(getattr(module, "__version__", "unknown"))
     if missing:
         return Diagnostic("LightAgent", False, f"{version}; missing APIs: {', '.join(missing)}")
-    return Diagnostic("LightAgent", version.startswith("0.9."), f"version {version}")
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    parsed = (int(match.group(1)), int(match.group(2))) if match else None
+    supported = parsed is not None and (0, 10) <= parsed < (0, 16)
+    message = f"version {version}"
+    if not supported:
+        message += "; expected >=0.10,<0.16"
+    return Diagnostic("LightAgent", supported, message)
