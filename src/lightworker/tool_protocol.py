@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import inspect
 import json
 import threading
+import time
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import Any
@@ -80,15 +82,18 @@ class EventLog:
         self.store = store
         self.run_id = run_id
         self._lock = threading.RLock()
-        self._sequence = self._last_sequence()
+        self.session = store.session(run_id)
+        self._migrate()
 
     def emit(self, event_type: str, data: dict[str, Any] | None = None, **fields: Any) -> dict[str, Any]:
-        with self._lock:
-            self._sequence += 1
+        with self.session.store.transaction():
+            native = self.session.append(
+                "lightworker.event", {"ui_type": event_type, "payload": {**(data or {}), **fields}}
+            )
             event = {
-                "sequence": self._sequence,
+                "sequence": native.sequence,
                 "type": event_type,
-                "timestamp": datetime.now(UTC).isoformat(),
+                "timestamp": native.timestamp,
                 "data": redact_value({**(data or {}), **fields}),
             }
             self.store.append_text(
@@ -99,34 +104,42 @@ class EventLog:
             return event
 
     def read(self, *, after: int = 0, limit: int = 500) -> list[dict[str, Any]]:
-        path = self.store.artifact_path(self.run_id, "events.jsonl")
-        if not path.is_file():
-            return []
-        values: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict) and int(value.get("sequence") or 0) > after:
-                values.append(value)
-            if len(values) >= limit:
-                break
-        return values
+        return [
+            {
+                "sequence": e.sequence,
+                "type": e.data["ui_type"],
+                "timestamp": e.timestamp,
+                "data": e.data["payload"],
+            }
+            for e in self.session.events()
+            if e.type == "lightworker.event" and e.sequence > after
+        ][:limit]
 
-    def _last_sequence(self) -> int:
+    def _migrate(self) -> None:
         path = self.store.artifact_path(self.run_id, "events.jsonl")
         if not path.is_file():
-            return 0
-        last = 0
+            return
+        with self.session.store.transaction():
+            if any(e.type == "lightworker.events.migrated" for e in self.session.events()):
+                return
+            if any(e.type == "lightworker.event" for e in self.session.events()):
+                self.session.append("lightworker.events.migrated", {"source": "compatibility-cache"})
+                return
+            self._import_legacy(path)
+            self.session.append("lightworker.events.migrated", {"source": "events.jsonl"})
+
+    def _import_legacy(self, path) -> None:
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if isinstance(value, dict):
-                last = max(last, int(value.get("sequence") or 0))
-        return last
+                self.session.append(
+                    "lightworker.event",
+                    {"ui_type": value.get("type"), "payload": value.get("data", {})},
+                    idempotency_key=f"legacy-ui-{value.get('sequence')}",
+                )
 
 
 class ApprovalBroker:
@@ -151,7 +164,7 @@ class ApprovalBroker:
         arguments: dict[str, Any],
         metadata: ToolMetadata,
     ) -> dict[str, Any]:
-        with self._lock:
+        with self.store.transaction(self.run_id):
             payload = self._load()
             fingerprint = self.fingerprint(tool_name, arguments)
             existing = next(
@@ -185,7 +198,7 @@ class ApprovalBroker:
     def decide(self, request_id: str, decision: str, note: str = "") -> dict[str, Any]:
         if decision not in {"approved", "rejected"}:
             raise ValueError("decision must be approved or rejected")
-        with self._lock:
+        with self.store.transaction(self.run_id):
             payload = self._load()
             request = next(
                 (item for item in payload["requests"] if item.get("request_id") == request_id),
@@ -211,11 +224,8 @@ class ApprovalBroker:
         return [item for item in self._load()["requests"] if item.get("status") == "pending"]
 
     def _load(self) -> dict[str, Any]:
-        path = self.store.artifact_path(self.run_id, "approvals.json")
-        if not path.is_file():
-            return {"requests": [], "decisions": {}}
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            value = self.store.read_json(self.run_id, "approvals.json")
         except (OSError, json.JSONDecodeError):
             return {"requests": [], "decisions": {}}
         if not isinstance(value, dict):
@@ -262,7 +272,9 @@ class ToolCatalog:
         approval_check = info.get("approval_check")
 
         @functools.wraps(tool)
-        def guarded(**arguments: Any) -> Any:
+        def guarded(*args: Any, **arguments: Any) -> Any:
+            if args:
+                arguments = dict(inspect.signature(tool).bind(*args, **arguments).arguments)
             with self._lock:
                 self.call_count += 1
                 call_number = self.call_count
@@ -316,14 +328,31 @@ class ToolCatalog:
                 "tool_started",
                 {"tool": name, "arguments": arguments, "call_number": call_number},
             )
+            started = time.monotonic()
             try:
                 result = tool(**arguments)
             except Exception as exc:
                 self.events.emit(
                     "tool_failed",
-                    {"tool": name, "error": redact_text(str(exc)), "error_type": type(exc).__name__},
+                    {
+                        "tool": name,
+                        "error": redact_text(str(exc)),
+                        "error_type": type(exc).__name__,
+                        "elapsed_seconds": time.monotonic() - started,
+                    },
                 )
                 raise
+            from .evidence import ArtifactRegistry, EvidenceStore
+
+            captured = EvidenceStore(self.events.store, self.events.run_id).capture(name, result)
+            if captured and isinstance(result, str):
+                try:
+                    structured = json.loads(result)
+                    if isinstance(structured, dict):
+                        structured["evidence_ids"] = [item["evidence_id"] for item in captured]
+                        result = json.dumps(structured, ensure_ascii=False)
+                except ValueError:
+                    pass
             artifact: str | None = None
             serialized = (
                 result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
@@ -336,14 +365,24 @@ class ToolCatalog:
                     artifact,
                     redact_text(serialized),
                 )
+                ArtifactRegistry(self.events.store, self.events.run_id).register(
+                    artifact, kind="tool_output", evidence_ids=[e["evidence_id"] for e in captured]
+                )
             safe_result = _cap_result(result, metadata.output_limit_bytes)
             self.events.emit(
                 "tool_completed",
-                {"tool": name, "output": safe_result, "full_output_artifact": artifact},
+                {
+                    "tool": name,
+                    "output": safe_result,
+                    "full_output_artifact": artifact,
+                    "evidence_ids": [e["evidence_id"] for e in captured],
+                    "elapsed_seconds": time.monotonic() - started,
+                },
             )
             return safe_result
 
         guarded.tool_info = info  # type: ignore[attr-defined]
+        guarded._lightworker_guarded = True
         return guarded
 
 
@@ -354,7 +393,20 @@ def _cap_result(value: Any, limit_bytes: int) -> Any:
     encoded = safe.encode("utf-8")
     if len(encoded) <= limit_bytes:
         return safe
-    return encoded[:limit_bytes].decode("utf-8", errors="ignore") + "\n…[tool output truncated]"
+    excerpt = encoded[: max(0, limit_bytes - 256)].decode("utf-8", errors="ignore")
+    try:
+        json.loads(safe)
+    except (ValueError, TypeError):
+        return excerpt + "\n…[tool output truncated; full output is in the artifact log]"
+    return json.dumps(
+        {
+            "ok": True,
+            "truncated": True,
+            "excerpt": excerpt,
+            "note": "Read the full output artifact for complete structured data.",
+        },
+        ensure_ascii=False,
+    )
 
 
 def _approval_reason(metadata: ToolMetadata) -> str:

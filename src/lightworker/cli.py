@@ -54,14 +54,18 @@ def doctor(
         bool,
         typer.Option("--build-image", help="构建缺失的基础镜像 / Build the sandbox image"),
     ] = False,
+    rebuild_image: Annotated[
+        bool,
+        typer.Option("--rebuild-image", help="重建沙箱 helper / Rebuild an existing sandbox image"),
+    ] = False,
 ) -> None:
     """检查本机依赖，不读取模型密钥内容 / Diagnose the local environment."""
     settings = WorkerConfig.load(config)
-    if build_image:
+    if build_image or rebuild_image:
         if not DockerSandbox.daemon_available():
             console.print("[red]Docker daemon 未运行 / Docker daemon is not running.[/red]")
             raise typer.Exit(2)
-        if not DockerSandbox.image_exists(settings.image):
+        if rebuild_image or not DockerSandbox.image_exists(settings.image):
             assert settings.dockerfile is not None
             assert settings.docker_context is not None
             with console.status("正在构建沙箱镜像 / Building sandbox image..."):

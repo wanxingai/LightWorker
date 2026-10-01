@@ -7,10 +7,12 @@ stdout. No shell is involved.
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import socket
@@ -55,7 +57,289 @@ def main() -> int:
 
 
 def health(params: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
-    return {"workspace": str(WORKSPACE), "uid": os.getuid()}
+    return {
+        "workspace": str(WORKSPACE),
+        "uid": os.getuid(),
+        "protocol_version": 2,
+        "capabilities": sorted(ACTIONS),
+    }
+
+
+def ptc_eval(params: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    """Called only by the Docker helper. A suspended call is bridged by the host policy layer."""
+    source = require_string(params, "source")
+    if len(source) > 32768:
+        raise HelperError("code program exceeds size limit")
+    tree = ast.parse(source)
+    allowed_nodes = (
+        ast.Module,
+        ast.Assign,
+        ast.Expr,
+        ast.For,
+        ast.If,
+        ast.Name,
+        ast.Load,
+        ast.Store,
+        ast.Constant,
+        ast.List,
+        ast.Tuple,
+        ast.Dict,
+        ast.Subscript,
+        ast.Slice,
+        ast.Call,
+        ast.keyword,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.BoolOp,
+        ast.Compare,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.FloorDiv,
+        ast.Mod,
+        ast.USub,
+        ast.Not,
+        ast.And,
+        ast.Or,
+        ast.Eq,
+        ast.NotEq,
+        ast.Lt,
+        ast.Gt,
+        ast.LtE,
+        ast.GtE,
+        ast.In,
+        ast.NotIn,
+        ast.IfExp,
+    )
+    functions = {"call", "len", "range", "str", "int", "float", "sum", "min", "max", "sorted"}
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed_nodes):
+            raise HelperError(f"unsupported code construct: {type(node).__name__}")
+        if isinstance(node, ast.Name) and node.id.startswith("_"):
+            raise HelperError("private identifiers are blocked")
+        if isinstance(node, ast.Call) and (
+            not isinstance(node.func, ast.Name) or node.func.id not in functions
+        ):
+            raise HelperError("only the documented code-mode functions can be called")
+    history = params.get("results", [])
+    cursor = 0
+
+    class PendingCall(Exception):
+        def __init__(self, request):
+            self.request = request
+
+    def call(name, arguments):
+        nonlocal cursor
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            raise HelperError("call requires a tool name and argument object")
+        if cursor >= len(history):
+            raise PendingCall({"name": name, "arguments": arguments})
+        previous = history[cursor]
+        cursor += 1
+        if previous["name"] != name or previous["arguments"] != arguments:
+            raise HelperError("code replay changed an already executed call")
+        return previous["value"]
+
+    def bounded_range(*args):
+        value = range(*args)
+        if len(value) > 1000:
+            raise HelperError("code loop exceeds iteration bound")
+        return value
+
+    namespace = {
+        "__builtins__": {},
+        "call": call,
+        "range": bounded_range,
+        "len": len,
+        "str": str,
+        "int": int,
+        "float": float,
+        "sum": sum,
+        "min": min,
+        "max": max,
+        "sorted": sorted,
+    }
+    try:
+        exec(compile(tree, "<docker-code-mode>", "exec"), namespace)
+    except PendingCall as pending:
+        return {"tool_request": pending.request}
+    return {"result": namespace.get("result")}
+
+
+def _terminal_dir(params):
+    identity = require_string(params, "terminal_id")
+    if not re.fullmatch(r"[a-f0-9]{32}", identity):
+        raise HelperError("invalid terminal identifier")
+    directory = Path("/tmp/lightworker-terminals") / identity
+    return directory
+
+
+def terminal_start(params, policy):
+    argv = params.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+        raise HelperError("argv must be a non-empty string array")
+    validate_shell_command(argv, policy)
+    directory = _terminal_dir(params)
+    directory.mkdir(parents=True, exist_ok=False)
+    fifo = directory / "input"
+    os.mkfifo(fifo, 0o600)
+    # The runner, process and FIFO live only inside the isolated container.
+    runner = """import json, os, subprocess, sys
+from pathlib import Path
+directory = Path(sys.argv[1])
+argv = json.loads(sys.argv[2])
+fd = os.open(directory / 'input', os.O_RDWR)
+with os.fdopen(fd, 'rb', buffering=0) as stream, (directory / 'output').open('ab', buffering=0) as output:
+    process = subprocess.Popen(argv, stdin=stream, stdout=output, stderr=output, start_new_session=True)
+    (directory / 'pid').write_text(str(process.pid))
+    (directory / 'exit').write_text(str(process.wait()))
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-c", runner, str(directory), json.dumps(argv)],
+        cwd=WORKSPACE,
+        env=safe_environment(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    (directory / "runner").write_text(str(process.pid))
+    return {"terminal_id": params["terminal_id"], "running": True}
+
+
+def terminal_poll(params, policy):
+    directory = _terminal_dir(params)
+    output_file = directory / "output"
+    after = max(0, int(params.get("after", 0)))
+    maximum = int(policy.get("max_output_bytes", 32768))
+    output = b""
+    if output_file.is_file():
+        with output_file.open("rb") as stream:
+            stream.seek(after)
+            output = stream.read(maximum)
+    finished = directory / "exit"
+    running = not finished.exists()
+    if running and (directory / "runner").is_file():
+        try:
+            os.kill(int((directory / "runner").read_text()), 0)
+        except ProcessLookupError as exc:
+            raise HelperError("terminal runner disappeared before publishing its exit status") from exc
+    return {
+        "running": running,
+        "exit_code": int(finished.read_text()) if finished.exists() else None,
+        "output": output.decode("utf-8", errors="replace"),
+        "cursor": after + len(output),
+        "drained": not output_file.exists() or after + len(output) >= output_file.stat().st_size,
+    }
+
+
+def terminal_send(params, policy):
+    directory = _terminal_dir(params)
+    text = require_string(params, "text")
+    if len(text.encode()) > 16384:
+        raise HelperError("terminal input exceeds limit")
+    fd = os.open(directory / "input", os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+    return {"sent": len(text)}
+
+
+def terminal_stop(params, policy):
+    directory = _terminal_dir(params)
+    for filename in ("pid", "runner"):
+        path = directory / filename
+        if path.is_file():
+            try:
+                os.killpg(int(path.read_text()), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    return {"stopped": True}
+
+
+def lsp_request(params, policy):
+    argv = params.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+        raise HelperError("invalid language server argv")
+    validate_shell_command(argv, policy)
+    method = require_string(params, "method")
+    allowed = {
+        "textDocument/definition",
+        "textDocument/references",
+        "textDocument/documentSymbol",
+        "workspace/symbol",
+        "textDocument/hover",
+        "textDocument/completion",
+    }
+    if method not in allowed:
+        raise HelperError("LSP method is not read-only or is unsupported")
+    process = subprocess.Popen(
+        argv,
+        cwd=WORKSPACE,
+        env=safe_environment(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 25
+
+    def send(payload):
+        body = json.dumps(payload).encode()
+        process.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        process.stdin.flush()
+
+    def receive(request_id):
+        buffer = b""
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))
+            if not ready:
+                break
+            chunk = os.read(process.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            buffer += chunk
+            if len(buffer) > 1048576:
+                raise HelperError("language server response exceeds limit")
+            while b"\r\n\r\n" in buffer:
+                header, body = buffer.split(b"\r\n\r\n", 1)
+                match = re.search(rb"Content-Length:\s*(\d+)", header, re.I)
+                if not match:
+                    raise HelperError("invalid LSP response framing")
+                length = int(match.group(1))
+                if len(body) < length:
+                    break
+                value = json.loads(body[:length])
+                buffer = body[length:]
+                if value.get("id") == request_id:
+                    return value
+        raise HelperError("language server request timed out")
+
+    try:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"processId": None, "rootUri": WORKSPACE.as_uri(), "capabilities": {}},
+            }
+        )
+        receive(1)
+        send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        send({"jsonrpc": "2.0", "id": 2, "method": method, "params": params.get("params", {})})
+        return {"response": receive(2)}
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
 
 
 def security_probe(params: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
@@ -630,6 +914,12 @@ def cap(value: str, policy: dict[str, Any], *, allow_full: bool = False) -> str:
 
 
 ACTIONS = {
+    "ptc_eval": ptc_eval,
+    "terminal_start": terminal_start,
+    "terminal_poll": terminal_poll,
+    "terminal_send": terminal_send,
+    "terminal_stop": terminal_stop,
+    "lsp_request": lsp_request,
     "health": health,
     "security_probe": security_probe,
     "list_files": list_files,

@@ -33,6 +33,9 @@ class RunStatus(StrEnum):
 class RuntimeMode(StrEnum):
     AGENTIC = "agentic"
     WORKFLOW = "workflow"
+    CODE = "code"
+    MINIMAL = "minimal"
+    RALPH = "ralph"
 
 
 class GoalStatus(StrEnum):

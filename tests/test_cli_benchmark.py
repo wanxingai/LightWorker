@@ -5,6 +5,7 @@ from pathlib import Path
 from conftest import run_git
 from typer.testing import CliRunner
 
+from lightworker import __version__
 from lightworker.benchmark import get_case, load_cases, materialize_case
 from lightworker.cli import app, autodetect_verification
 
@@ -12,7 +13,7 @@ from lightworker.cli import app, autodetect_verification
 def test_version_flag_works_without_command():
     result = CliRunner().invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "LightWorker 0.4.0" in result.stdout
+    assert f"LightWorker {__version__}" in result.stdout
 
 
 def test_no_args_prints_help():

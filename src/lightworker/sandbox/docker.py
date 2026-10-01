@@ -124,6 +124,10 @@ class DockerSandbox(SandboxBackend):
                 health = self.call("health", {}, timeout=15)
                 if not health.get("ok"):
                     raise SandboxError("sandbox helper health check failed")
+                if health.get("protocol_version", 0) < 2:
+                    raise SandboxError(
+                        "sandbox image uses an old helper; run lightworker doctor --rebuild-image"
+                    )
             except Exception:
                 self.stop()
                 raise

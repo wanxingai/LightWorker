@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .models import RunRecord, RunStatus, utc_now
 
@@ -15,15 +16,37 @@ class RunStore:
         self.state_dir = state_dir.expanduser().resolve()
         self.runs_dir = self.state_dir / "runs"
 
+    def session(self, run_id: str):
+        from .sessions import TaskSession
+
+        _safe_identifier(run_id)
+        return TaskSession(self.state_dir, run_id)
+
+    def transaction(self, run_id: str):
+        return self.session(run_id).store.transaction()
+
     def create(self, record: RunRecord) -> Path:
         directory = self.run_dir(record.run_id)
-        directory.mkdir(parents=True, exist_ok=False)
-        (directory / "logs").mkdir()
-        (directory / "flow").mkdir()
+        if self.session(record.run_id).state("run.json") is not None or (directory / "run.json").exists():
+            raise FileExistsError(f"run already exists: {record.run_id}")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "logs").mkdir(exist_ok=True)
+        (directory / "flow").mkdir(exist_ok=True)
         self.save(record)
         return directory
 
     def save(self, record: RunRecord) -> None:
+        from .analysis_tools import CredentialVault, sanitize_and_capture_credentials
+
+        sanitized, credentials = sanitize_and_capture_credentials([record.task])
+        if credentials:
+            CredentialVault(self.state_dir).merge(
+                str(record.metadata.get("task_spec", {}).get("root_run_id") or record.run_id), credentials
+            )
+            record.task = sanitized[0]
+            from .policy import redact_value
+
+            record.metadata = redact_value(record.metadata)
         record.updated_at = utc_now()
         self.write_json(record.run_id, "run.json", record.model_dump(mode="json"))
 
@@ -47,12 +70,19 @@ class RunStore:
         return record
 
     def list(self) -> list[RunRecord]:
-        if not self.runs_dir.exists():
-            return []
         records: list[RunRecord] = []
-        for path in sorted(self.runs_dir.glob("*/run.json")):
+        identities = {p.parent.name for p in self.runs_dir.glob("*/run.json")}
+        from .sessions import session_store
+
+        with session_store(str(self.state_dir / "lightagent-sessions.sqlite3")).transaction() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT session_id FROM session_events "
+                "WHERE json_extract(payload, '$.data.name')='run.json'"
+            ).fetchall()
+            identities.update(row[0] for row in rows)
+        for run_id in sorted(identities):
             try:
-                records.append(RunRecord.model_validate_json(path.read_text(encoding="utf-8")))
+                records.append(self.load(run_id))
             except (ValueError, OSError):
                 continue
         return sorted(records, key=lambda item: item.created_at, reverse=True)
@@ -73,6 +103,8 @@ class RunStore:
     def write_text(self, run_id: str, name: str, value: str) -> Path:
         path = self.artifact_path(run_id, name)
         _atomic_write(path, value.encode("utf-8"))
+        if name in {"summary.md", "changes.patch", "plan.md", "git-status.txt"}:
+            self.session(run_id).set_state(f"artifact:{name}", value)
         return path
 
     def append_text(self, run_id: str, name: str, value: str) -> Path:
@@ -85,10 +117,47 @@ class RunStore:
         return path
 
     def write_json(self, run_id: str, name: str, value: Any) -> Path:
+        if _canonical_json(name):
+            self.session(run_id).set_state(name, value)
         return self.write_text(run_id, name, json.dumps(value, ensure_ascii=False, indent=2, default=str))
 
     def read_json(self, run_id: str, name: str) -> Any:
+        if _canonical_json(name):
+            with self.transaction(run_id):
+                projected = self.session(run_id).state(name)
+                if projected is not None:
+                    return projected
+                value = json.loads(self.artifact_path(run_id, name).read_text(encoding="utf-8"))
+                self.session(run_id).set_state(name, value)
+                return value
         return json.loads(self.artifact_path(run_id, name).read_text(encoding="utf-8"))
+
+
+def _canonical_json(name: str) -> bool:
+    return name.startswith("flow/") or name in {
+        "run.json",
+        "goal.json",
+        "control.json",
+        "approvals.json",
+        "agent-tree.json",
+        "working-memory.json",
+        "tool-manifest.json",
+        "plan.json",
+        "review-decision.json",
+        "jobs.json",
+        "evidence.json",
+        "artifacts.json",
+        "agents.json",
+        "providers.json",
+        "provider-health.json",
+        "schedules.json",
+        "context-state.json",
+        "plugin-lock.json",
+        "workflow-state.json",
+        "workflow-tool-resume.json",
+        "code-state.json",
+        "task-request.json",
+    }
 
 
 def _safe_identifier(value: str) -> str:
@@ -101,7 +170,7 @@ def _safe_identifier(value: str) -> str:
 
 def _atomic_write(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     with temporary.open("wb") as handle:
         handle.write(payload)
         handle.flush()

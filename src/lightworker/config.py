@@ -105,6 +105,10 @@ class RuntimeConfig(BaseModel):
     compression_ratio: float = Field(default=0.75, gt=0.4, lt=0.95)
     goal_budget: GoalBudget = Field(default_factory=GoalBudget)
     no_progress_limit: int = Field(default=4, ge=2, le=20)
+    deferred_tools: bool = True
+    ralph_rounds: int = Field(default=3, ge=1, le=20)
+    background_wait_seconds: int = Field(default=900, ge=1, le=3600)
+    workflow_presets: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
 
 
 class SchedulerConfig(BaseModel):
@@ -190,6 +194,11 @@ class RAGConfig(BaseModel):
     embedding_batch_size: int = Field(default=64, ge=1, le=256)
 
 
+class PluginConfig(BaseModel):
+    directories: list[Path] = Field(default_factory=list)
+    trusted_public_keys: list[str] = Field(default_factory=list)
+
+
 class WorkerConfig(BaseModel):
     state_dir: Path = Field(default_factory=lambda: user_data_path("lightworker", ensure_exists=False))
     image: str = "lightworker-python:3.11"
@@ -210,6 +219,7 @@ class WorkerConfig(BaseModel):
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     rag: RAGConfig = Field(default_factory=RAGConfig)
+    plugins: PluginConfig = Field(default_factory=PluginConfig)
     verification: list[VerificationCommand] = Field(default_factory=list)
     pip_index_url: str = "https://pypi.org/simple"
     max_pip_requirements: int = Field(default=10, ge=1, le=50)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -113,5 +114,47 @@ def test_pip_network_is_temporarily_attached_and_then_removed(git_repo: Path):
         assert installed["exit_code"] == 0, installed
         assert any(line.lower().startswith("tomli==2.2.1") for line in installed["frozen"])
         assert after["network_available"] is False
+    finally:
+        sandbox.stop()
+
+
+@pytest.mark.docker
+@pytest.mark.skipif(not docker_available(), reason="Docker daemon or LightWorker image unavailable")
+def test_docker_code_bridge_and_background_terminal(git_repo: Path):
+    (git_repo / "terminal_fixture.py").write_text("print('terminal verified')\n", encoding="utf-8")
+    sandbox = DockerSandbox(
+        run_id="docker-next-runtime",
+        workspace=git_repo,
+        image="lightworker-python:3.11",
+        limits=ResourceLimits(cpus=1, memory="1g", pids=128),
+        protected_patterns=[],
+        pip_index_url="https://pypi.org/simple",
+        max_pip_requirements=3,
+        shell_allowed_programs=["python"],
+    )
+    terminal_id = "a" * 32
+    try:
+        sandbox.start()
+        assert sandbox.call("ptc_eval", {"source": "result = sum([1, 2, 3])", "results": []})["result"] == 6
+        assert not sandbox.call("ptc_eval", {"source": "import os", "results": []})["ok"]
+        request = sandbox.call(
+            "ptc_eval", {"source": "result = call('read_file', {'path':'app.py'})", "results": []}
+        )
+        assert request["tool_request"]["name"] == "read_file"
+        started = sandbox.call(
+            "terminal_start", {"terminal_id": terminal_id, "argv": ["python", "terminal_fixture.py"]}
+        )
+        assert started["ok"] and started["running"]
+        output, cursor = "", 0
+        for _ in range(30):
+            result = sandbox.call("terminal_poll", {"terminal_id": terminal_id, "after": cursor})
+            assert result["ok"]
+            output += result["output"]
+            cursor = result["cursor"]
+            if not result["running"] and result["drained"]:
+                break
+            time.sleep(0.1)
+        assert result["exit_code"] == 0 and "terminal verified" in output
+        assert sandbox.call("terminal_stop", {"terminal_id": terminal_id})["ok"]
     finally:
         sandbox.stop()

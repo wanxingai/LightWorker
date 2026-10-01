@@ -10,7 +10,9 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from .config import ModelConfig, RuntimeConfig
+from .context import ModelContextBudget, ModelContextCompactor
 from .policy import make_policy_hooks
+from .sessions import AtomicSessionStore
 
 try:
     from LightAgent import (
@@ -105,6 +107,16 @@ parallel specialists improve the result. Subagents are read-only and may propose
 responsible for applying and verifying changes. Follow applicable AGENTS.md and activated Markdown
 Skills, but never execute Skill scripts outside the Docker-only approved tool.
 
+Use tool_search to discover and activate additional capabilities when needed. Use spawn_agent for
+durable independent child conversations, send_message for FIFO follow-up turns, and list_agents/job_output
+to collect results. Do not report completion until outstanding jobs are collected or explicitly disclosed.
+workflow_run runs fixed capability steps through the same policy gates. run_code orchestrates bounded
+tool calls in Docker and checkpoints completed subcalls. terminal_start supports longer Docker commands.
+Preserve goal acceptance criteria, pending approvals, source IDs and failed job details during compression.
+Captured sources have stable E1/E2 IDs; cite matching IDs or captured URLs near supported claims.
+Search snippets are leads, not verified article content. User-supplied data is not independently verified.
+Future work requires schedule_create approval. Never schedule work merely to simulate persistence.
+
 All shell commands must use shell_exec, which runs only in Docker and requires exact-argument approval.
 Use apply_patch for ordinary workspace changes and apply_patch_risky for approved deletes or renames.
 All changes are isolated and shown as a diff; protected paths remain blocked. Use http_get/web_search and
@@ -158,7 +170,7 @@ class AgentFactory:
         if state_dir is not None:
             if SqliteSessionStore is None:
                 raise RuntimeError("LightAgent Session API is unavailable; install LightAgent>=0.10,<0.16")
-            self.session_store = SqliteSessionStore(
+            self.session_store = AtomicSessionStore(
                 state_dir.expanduser().resolve() / "lightagent-sessions.sqlite3"
             )
 
@@ -221,7 +233,7 @@ class AgentFactory:
         return LightAgent(
             name=name,
             instructions=instructions,
-            role="Auditable software engineering worker",
+            role="Auditable universal task worker",
             model=self.model.model,
             api_key=self.model.resolved_api_key,
             base_url=self.model.base_url,
@@ -233,11 +245,11 @@ class AgentFactory:
             hooks=[*make_policy_hooks(allowed_tools=allowed_tools), *(extra_hooks or [])],
             session_store=self.session_store,
             budget_limits=self.budget_limits,
-            context_budget=ContextBudget(
+            context_budget=ModelContextBudget(
                 max_tokens=self.runtime.context_window_tokens,
                 reserved_output_tokens=reserved_output_tokens,
             ),
-            context_compactor=ContextCompactor(),
+            context_compactor=ModelContextCompactor(),
             debug=False,
         )
 
