@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
+from .sessions import AtomicSessionStore
 from .storage import RunStore
 
 try:
@@ -20,7 +22,7 @@ except ImportError:  # pragma: no cover - guarded by the package dependency
     InboxMessageType = None  # type: ignore[assignment]
     SqliteSessionStore = None  # type: ignore[assignment]
 
-QueueStatus = Literal["pending", "running", "completed", "guided", "failed"]
+QueueStatus = Literal["pending", "running", "completed", "guided", "failed", "cancelled"]
 
 
 class ConversationMessageQueue:
@@ -38,10 +40,16 @@ class ConversationMessageQueue:
         if AgentRuntime is None or SqliteSessionStore is None:
             raise RuntimeError("LightAgent Session API is unavailable; install LightAgent>=0.10,<0.16")
         self.store = store
-        self.session_store = session_store or SqliteSessionStore(
+        self.session_store = session_store or AtomicSessionStore(
             store.state_dir / "lightagent-sessions.sqlite3"
         )
         self._lock = threading.RLock()
+
+    @contextmanager
+    def _transaction(self):
+        transaction = getattr(self.session_store, "transaction", nullcontext)
+        with self._lock, transaction():
+            yield
 
     def active(self, root_run_id: str) -> list[dict[str, Any]]:
         return [
@@ -51,16 +59,30 @@ class ConversationMessageQueue:
     def all(self, root_run_id: str) -> list[dict[str, Any]]:
         return [dict(item) for item in self._read(root_run_id)]
 
-    def enqueue(self, root_run_id: str, message: str) -> dict[str, Any]:
-        with self._lock:
+    def enqueue(
+        self, root_run_id: str, message: str, *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        with self._transaction():
             self._ensure_migrated(root_run_id)
             runtime = self._open(root_run_id)
+            if idempotency_key:
+                existing = next(
+                    (
+                        item
+                        for item in self._project(runtime.session)
+                        if item.get("idempotency_key") == idempotency_key
+                    ),
+                    None,
+                )
+                if existing:
+                    return existing
             item = {
                 "id": uuid4().hex,
                 "message": message,
                 "status": "pending",
                 "created_at": _now(),
                 "run_id": None,
+                "idempotency_key": idempotency_key,
             }
             runtime.inbox.enqueue(
                 InboxMessageType.FOLLOWUP,
@@ -78,12 +100,15 @@ class ConversationMessageQueue:
             return dict(item)
 
     def claim(self, root_run_id: str, item_id: str, run_id: str) -> dict[str, Any] | None:
-        with self._lock:
+        with self._transaction():
             items = self._read(root_run_id)
             if any(item.get("status") == "running" for item in items):
                 return None
             item = next((value for value in items if value.get("id") == item_id), None)
             if item is None or item.get("status") != "pending":
+                return None
+            first = next((value for value in items if value.get("status") == "pending"), None)
+            if first is not item:
                 return None
             runtime = self._open(root_run_id)
             message = self._active_inbox_message(runtime, item_id)
@@ -111,7 +136,7 @@ class ConversationMessageQueue:
             return dict(self._find(projected, item_id))
 
     def release(self, root_run_id: str, item_id: str, error: str = "") -> None:
-        with self._lock:
+        with self._transaction():
             items = self._read(root_run_id)
             item = self._find(items, item_id)
             runtime = self._open(root_run_id)
@@ -142,7 +167,7 @@ class ConversationMessageQueue:
             self._sync_cache(root_run_id, runtime)
 
     def complete(self, root_run_id: str, item_id: str, *, error: str = "") -> None:
-        with self._lock:
+        with self._transaction():
             items = self._read(root_run_id)
             self._find(items, item_id)
             runtime = self._open(root_run_id)
@@ -170,7 +195,7 @@ class ConversationMessageQueue:
             self._sync_cache(root_run_id, runtime)
 
     def guide(self, root_run_id: str, item_id: str) -> dict[str, Any]:
-        with self._lock:
+        with self._transaction():
             items = self._read(root_run_id)
             item = self._find(items, item_id)
             if item.get("status") != "pending":
@@ -224,9 +249,32 @@ class ConversationMessageQueue:
                 roots.add(str(root_run_id))
         return sorted(roots)
 
+    def cancel(self, root_run_id, item_id):
+        with self._transaction():
+            runtime = self._open(root_run_id)
+            item = self._find(self._project(runtime.session), item_id)
+            if item["status"] != "pending":
+                raise ValueError("only pending messages can be removed")
+            active = self._active_inbox_message(runtime, item_id)
+            if active:
+                self._record_inbox_status(runtime, active, "rejected", reason="cancelled by user")
+            self._append(runtime, "lightworker.queue.cancelled", {"item_id": item_id})
+            self._sync_cache(root_run_id, runtime)
+        return {"item_id": item_id, "status": "cancelled"}
+
+    def reorder(self, root_run_id, item_ids):
+        with self._transaction():
+            runtime = self._open(root_run_id)
+            pending = [i["id"] for i in self._project(runtime.session) if i["status"] == "pending"]
+            if len(item_ids) != len(set(item_ids)) or set(item_ids) != set(pending):
+                raise ValueError("include every pending message ID exactly once")
+            self._append(runtime, "lightworker.queue.reordered", {"item_ids": item_ids})
+            self._sync_cache(root_run_id, runtime)
+        return {"order": item_ids}
+
     def snapshot(self, root_run_id: str) -> dict[str, Any]:
         """Return a redaction-ready native conversation runtime snapshot."""
-        with self._lock:
+        with self._transaction():
             self._ensure_migrated(root_run_id)
             runtime = self._open(root_run_id)
             snapshot = runtime.snapshot()
@@ -235,7 +283,7 @@ class ConversationMessageQueue:
             return snapshot
 
     def _read(self, root_run_id: str) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._transaction():
             self._ensure_migrated(root_run_id)
             runtime = self._open(root_run_id)
             items = self._project(runtime.session)
@@ -472,6 +520,13 @@ class ConversationMessageQueue:
                 item = by_id.get(str(data.get("item_id") or ""))
                 if item is not None:
                     item.update({"status": "guided", "guided_at": data.get("guided_at")})
+            elif event.type == "lightworker.queue.cancelled":
+                item = by_id.get(str(data.get("item_id")))
+                if item is not None:
+                    item["status"] = "cancelled"
+            elif event.type == "lightworker.queue.reordered":
+                reordered = data.get("item_ids", [])
+                ordered = [identity for identity in ordered if identity not in reordered] + reordered
         return [dict(by_id[item_id]) for item_id in ordered]
 
     @staticmethod

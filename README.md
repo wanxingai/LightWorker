@@ -1,10 +1,27 @@
 # LightWorker
 
-LightWorker 是基于 LightAgent 统一运行时（当前兼容 `>=0.10,<0.16`）的本地通用 Agent Worker。它不再把任务拆成“编码任务”和“通用任务”两个入口：检索、分析、写作、浏览器操作、RAG、Shell、代码修改和后续追问都可以在同一个动态 Agentic Loop 中按需组合。只有发生文件编辑时才展示 diff。
+LightWorker 是基于 LightAgent 统一运行时（当前兼容 `>=0.11,<0.16`）的本地通用 Agent Worker。它不再把任务拆成“编码任务”和“通用任务”两个入口：检索、分析、写作、浏览器操作、RAG、Shell、代码修改和后续追问都可以在同一个动态 Agentic Loop 中按需组合。只有发生文件编辑时才展示 diff。
 
-LightWorker is a local universal Agent Worker powered by the LightAgent unified runtime (currently compatible with `>=0.10,<0.16`). Research, analysis, writing, browser automation, RAG, Docker shell, code changes, and follow-up messages share one dynamic Agentic Loop. A diff is shown only when files actually changed.
+LightWorker is a local universal Agent Worker powered by the LightAgent unified runtime (currently compatible with `>=0.11,<0.16`). Research, analysis, writing, browser automation, RAG, Docker shell, code changes, and follow-up messages share one dynamic Agentic Loop. A diff is shown only when files actually changed.
 
 Agentica 只作为能力设计参考，不是运行时依赖。核心模型循环、Trace、Hook、LightFlow 和 MCP 基础仍来自 LightAgent。
+
+## v0.5.0 — Next Runtime
+
+这一版将任务状态、审批、Goal、Job、证据和执行事件统一到 LightAgent Session；当前最低运行时版本为 **LightAgent 0.11**（实际已发布版本号，不是旧 Roadmap 的里程碑编号）。
+
+- SQLite `BEGIN IMMEDIATE` 事务、顺序 CAS 和幂等消息；兼容 JSON 文件不再覆盖 Session。
+- 持久任务/子 Agent/终端 Job：事务领取、续租、epoch 隔离、暂停/取消、冷恢复和增量输出游标。
+- 可持续子 Agent 独立 Session、spawn/fork Provider、FIFO 追问和只读权限快照。
+- 原生 CapabilityRegistry 组合、工具按需搜索与加载、Provider 健康信息、精确参数审批。
+- Agentic / Workflow / Docker Code Mode / Minimal / Ralph 五种执行策略；固定步骤和代码子调用有持久检查点。
+- 自动上下文压缩保留完整工具调用组、最新用户输入、Goal、审批、Job 和来源索引；长工具输出落盘。
+- 稳定 Evidence ID、正文/哈希/访问时间、工件版本哈希；引用可在 UI 中查看已捕获正文。
+- Docker 后台终端、增量输出及只读 LSP 查询；不开放宿主机 Shell。
+- 一次性/间隔定时任务、声明式插件哈希锁、可选 Ed25519 签名。
+- WebUI 后台工作/证据/运行指标/定时任务/插件入口，排队消息支持移除、重排和引导。
+
+配置、恢复边界、API 和验收说明见 [Next Runtime 文档](docs/lightworker_next_runtime.zh-CN.md)。旧版能力和 API 保持兼容。所有执行策略仍共用同一个通用任务入口；没有按领域拆分任务。
 
 ## v0.4.0
 
@@ -66,7 +83,7 @@ Docker 不可用时，动态运行时会安全降级为纯 Python 只读工作�
 
 ## 安装
 
-要求 Python 3.11、Git、Docker Desktop，以及相邻目录中的 LightAgent 统一运行时源码（`>=0.10,<0.16`）：
+要求 Python 3.11、Git、Docker Desktop，以及相邻目录中的 LightAgent 统一运行时源码（`>=0.11,<0.16`）：
 
 ```text
 Langchain-Chatchat/

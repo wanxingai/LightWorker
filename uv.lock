@@ -934,7 +934,7 @@ wheels = [
 
 [[package]]
 name = "lightagent"
-version = "0.10.0"
+version = "0.11.0"
 source = { editable = "../LightAgent" }
 dependencies = [
     { name = "colorama" },
@@ -970,7 +970,7 @@ provides-extras = ["litellm", "nos", "oss"]
 
 [[package]]
 name = "lightworker"
-version = "0.4.0"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -1000,9 +1000,13 @@ documents = [
 drissionpage = [
     { name = "drissionpage" },
 ]
+signing = [
+    { name = "cryptography" },
+]
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", marker = "extra == 'signing'", specifier = ">=44,<51" },
     { name = "drissionpage", marker = "extra == 'drissionpage'", specifier = ">=4.1.1.4,<5" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "lightagent", editable = "../LightAgent" },
@@ -1022,7 +1026,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.15,<1" },
     { name = "uvicorn", specifier = ">=0.34,<1" },
 ]
-provides-extras = ["drissionpage", "documents", "dev"]
+provides-extras = ["signing", "drissionpage", "documents", "dev"]
 
 [[package]]
 name = "loguru"

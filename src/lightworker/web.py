@@ -25,8 +25,11 @@ from . import __version__
 from .analysis_tools import CredentialVault, sanitize_and_capture_credentials
 from .config import WorkerConfig, parse_verification_command
 from .context import ContextCompressor
+from .continuation import active_agents
 from .control import ControlStore
+from .evidence import ArtifactRegistry, EvidenceStore
 from .goals import GoalManager
+from .jobs import JobRegistry
 from .memory import WorkspaceMemory, workspace_scope
 from .message_queue import ConversationMessageQueue
 from .models import (
@@ -38,9 +41,11 @@ from .models import (
     VerificationCommand,
     VerificationKind,
 )
+from .plugins import PluginManager
 from .policy import redact_value
 from .rag import RAGIndex
 from .sandbox_helper import HelperError, validate_command
+from .schedules import ScheduleStore
 from .skills import SkillRegistry
 from .storage import RunStore
 from .tool_protocol import ApprovalBroker, EventLog
@@ -56,6 +61,10 @@ ARTIFACTS = {
     "runtime": ("lightagent-runtime.json", "application/json; charset=utf-8"),
     "conversation": ("lightagent-conversation.json", "application/json; charset=utf-8"),
     "status": ("git-status.txt", "text/plain; charset=utf-8"),
+    "task_session": ("task-session.json", "application/json; charset=utf-8"),
+    "evidence": ("evidence.json", "application/json; charset=utf-8"),
+    "artifact_manifest": ("artifacts.json", "application/json; charset=utf-8"),
+    "context": ("context-state.json", "application/json; charset=utf-8"),
 }
 ACTIVE_STATUSES = {RunStatus.CREATED, RunStatus.PREPARING, RunStatus.RUNNING}
 QUEUE_BLOCKING_STATUSES = ACTIVE_STATUSES | {
@@ -95,6 +104,7 @@ class ReviewDecisionRequest(BaseModel):
 
 class FollowUpRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20_000)
+    idempotency_key: str | None = Field(default=None, max_length=200)
 
     @field_validator("message")
     @classmethod
@@ -137,6 +147,26 @@ class GoalUpdateRequest(BaseModel):
     budget: GoalBudget | None = None
 
 
+class ActionRequest(BaseModel):
+    action: Literal["pause", "resume", "cancel", "delete"]
+
+
+class ScheduleRequest(BaseModel):
+    task: str = Field(min_length=1, max_length=20_000)
+    source_run_id: str
+    next_at: float | None = None
+    interval_seconds: int | None = Field(default=None, ge=60)
+
+
+class PluginTrustRequest(BaseModel):
+    path: str
+    digest: str = Field(min_length=64, max_length=64)
+
+
+class QueueOrderRequest(BaseModel):
+    item_ids: list[str] = Field(max_length=200)
+
+
 class TaskManagerProtocol(Protocol):
     def submit(self, run_id: str, action: str, function: Callable[[], Any]) -> None: ...
 
@@ -148,7 +178,8 @@ class TaskManagerProtocol(Protocol):
 class TaskScheduler:
     """Bounded concurrent task scheduler with observable queue/running state."""
 
-    def __init__(self, max_workers: int = 2) -> None:
+    def __init__(self, max_workers: int = 2, store: RunStore | None = None) -> None:
+        self.store = store
         self._states: dict[str, dict[str, Any]] = {}
         self._futures: dict[str, Future[Any]] = {}
         self._lock = threading.RLock()
@@ -168,17 +199,36 @@ class TaskScheduler:
                 "error": None,
                 "queued_at": datetime.now(UTC).isoformat(),
             }
-            self._futures[run_id] = self._executor.submit(self._work, run_id, action, function)
+            job_id = None
+            if self.store:
+                registry = JobRegistry(self.store, run_id)
+                if any(
+                    j["kind"] == "task" and j["status"] in {"pending", "running"} for j in registry.recover()
+                ):
+                    self._states.pop(run_id, None)
+                    raise ValueError("task already has a durable activation")
+                job_id = registry.create("task", {"action": action})["job_id"]
+            self._futures[run_id] = self._executor.submit(self._work, run_id, action, function, job_id)
 
     def status(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
             value = self._states.get(run_id)
+            if self.store:
+                jobs = [j for j in JobRegistry(self.store, run_id).recover() if j["kind"] == "task"]
+                if jobs:
+                    job = jobs[-1]
+                    value = {
+                        "state": {"pending": "queued"}.get(job["status"], job["status"]),
+                        "action": job["payload"]["action"],
+                        "error": job["error"],
+                        "job_id": job["job_id"],
+                    }
             return dict(value) if value else None
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _work(self, run_id: str, action: str, function: Callable[[], Any]) -> None:
+    def _work(self, run_id: str, action: str, function: Callable[[], Any], job_id=None) -> None:
         with self._lock:
             self._states[run_id] = {
                 "state": "running",
@@ -187,7 +237,23 @@ class TaskScheduler:
                 "started_at": datetime.now(UTC).isoformat(),
             }
         try:
-            function()
+            if self.store and job_id:
+                registry = JobRegistry(self.store, run_id)
+                claimed = registry.claim(job_id)
+                if claimed is None:
+                    return
+
+                def operation(_):
+                    result = function()
+                    if isinstance(result, RunRecord):
+                        if result.status == RunStatus.FAILED:
+                            raise RuntimeError(result.error or "task failed")
+                        return {"run_id": result.run_id, "status": result.status.value, "error": result.error}
+                    return result
+
+                registry._drive(job_id, claimed["lease_epoch"], operation)
+            else:
+                function()
         except Exception as exc:  # pragma: no cover - defensive boundary around runner
             with self._lock:
                 self._states[run_id] = {
@@ -217,9 +283,11 @@ def create_app(
     runner_factory: Callable[[WorkerConfig], CodingTaskRunner] = CodingTaskRunner,
 ) -> FastAPI:
     own_manager = task_manager is None
-    manager = task_manager or TaskScheduler(max_workers=settings.scheduler.max_tasks)
     store = RunStore(settings.state_dir)
+    manager = task_manager or TaskScheduler(max_workers=settings.scheduler.max_tasks, store=store)
     message_queue = ConversationMessageQueue(store)
+    schedules = ScheduleStore(store)
+    plugins = PluginManager(store, settings.plugins.directories, settings.plugins.trusted_public_keys)
     queue_dispatch_lock = threading.RLock()
     _migrate_legacy_credentials(store, settings.state_dir)
     _recover_stale_runs(store, manager)
@@ -229,9 +297,23 @@ def create_app(
     async def lifespan(_: FastAPI):
         for root_run_id in message_queue.roots():
             _dispatch_next_queued_message(root_run_id)
-        yield
-        if own_manager:
-            manager.close()
+
+        async def schedule_loop():
+            while True:
+                await asyncio.to_thread(_dispatch_schedules)
+                await asyncio.sleep(1)
+
+        timer = asyncio.create_task(schedule_loop())
+        try:
+            yield
+        finally:
+            timer.cancel()
+            try:
+                await timer
+            except asyncio.CancelledError:
+                pass
+            if own_manager:
+                manager.close()
 
     app = FastAPI(
         title="LightWorker",
@@ -246,6 +328,42 @@ def create_app(
     app.state.task_manager = manager
     app.state.message_queue = message_queue
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.middleware("http")
+    async def check_origin(request, call_next):
+        origin = request.headers.get("origin")
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and origin:
+            if urllib.parse.urlsplit(origin).netloc != request.headers.get("host"):
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse({"detail": "cross-origin mutation is not allowed"}, status_code=403)
+        try:
+            return await call_next(request)
+        except (KeyError, ValueError) as exc:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+
+    def _dispatch_schedules():
+        for schedule in schedules.due():
+            try:
+                source = store.load(schedule["source_run_id"])
+                if _run_blocks_queue(source):
+                    raise ValueError("source conversation is active; dispatch deferred")
+                run_id = schedule["pending_run_id"]
+                if manager.status(run_id) or store.artifact_path(run_id, "run.json").exists():
+                    schedules.dispatched(schedule["schedule_id"], epoch=schedule["lease_epoch"])
+                    continue
+                spec = _prepare_followup_spec(source, schedule["task"], followup_id=run_id)
+                _submit_spec(spec, "scheduled")
+                schedules.dispatched(schedule["schedule_id"], epoch=schedule["lease_epoch"])
+            except Exception as exc:
+                try:
+                    schedules.dispatched(
+                        schedule["schedule_id"], epoch=schedule["lease_epoch"], error=str(exc)
+                    )
+                except ValueError:
+                    pass  # Another dispatcher or a human revoked this lease.
 
     def _run_blocks_queue(record: RunRecord, *, ignore_job: bool = False) -> bool:
         job = manager.status(record.run_id)
@@ -306,6 +424,18 @@ def create_app(
         queue_item_id: str | None = None,
     ) -> None:
         root_run_id = spec.root_run_id or spec.run_id
+        if own_manager:
+            with store.transaction(spec.run_id):
+                store.write_json(spec.run_id, "task-request.json", spec.model_dump(mode="json"))
+                if store.session(spec.run_id).state("run.json") is None:
+                    store.create(
+                        RunRecord(
+                            run_id=spec.run_id,
+                            task=spec.task,
+                            repo=str(spec.repo),
+                            metadata={"task_spec": spec.model_dump(mode="json"), "bootstrap": True},
+                        )
+                    )
 
         def execute() -> Any:
             try:
@@ -329,7 +459,9 @@ def create_app(
         if _run_blocks_queue(record, ignore_job=True):
             return
         if queue_item_id:
-            message_queue.complete(root_run_id, queue_item_id)
+            message_queue.complete(
+                root_run_id, queue_item_id, error=record.error if record.status == RunStatus.FAILED else None
+            )
         _dispatch_next_queued_message(root_run_id, finished_run_id=run_id)
 
     def _dispatch_next_queued_message(
@@ -474,6 +606,18 @@ def create_app(
         active_messages = message_queue.active(root_run_id)
         native = message_queue.snapshot(root_run_id)
         payload = _run_detail(store, record, manager.status(run_id))
+        payload["jobs"] = JobRegistry(store, run_id).recover()
+        payload["provider_health"] = store.session(run_id).state("provider-health.json") or {}
+        payload["providers"] = store.session(run_id).state("providers.json") or []
+        payload["artifact_manifest"] = ArtifactRegistry(store, run_id).list()
+        payload["task_session"] = {"session_id": run_id, "event_count": len(store.session(run_id).events())}
+        evidence = EvidenceStore(store, run_id).list()
+        if evidence:
+            payload["citations"] = [
+                {**e, "url": e["url"] or f"/api/runs/{run_id}/evidence/{e['evidence_id']}"} for e in evidence
+            ]
+        children = store.session(run_id).state("agents.json") or {}
+        payload["continuable_agents"] = list(children.get("agents", {}).values())
         payload["message_queue"] = redact_value(active_messages)
         payload["conversation_runtime"] = redact_value(
             {
@@ -542,7 +686,9 @@ def create_app(
         ):
             safe_message, credentials = sanitize_and_capture_credentials([payload.message])
             CredentialVault(settings.state_dir).merge(root.run_id, credentials)
-            item = message_queue.enqueue(root.run_id, safe_message[0])
+            item = message_queue.enqueue(
+                root.run_id, safe_message[0], idempotency_key=payload.idempotency_key
+            )
             EventLog(store, parent.run_id).emit("followup_queued", item)
             if parent.status not in QUEUE_BLOCKING_STATUSES and not (
                 parent_job and parent_job.get("state") in {"queued", "running"}
@@ -658,7 +804,19 @@ def create_app(
                 detail="legacy general tasks continue through a follow-up message",
             )
         ControlStore(store, run_id).set_state("running")
-        _submit_existing(manager, run_id, "resume", lambda: runner_factory(settings).resume(run_id))
+
+        def execute():
+            try:
+                runner = runner_factory(settings)
+                if record.metadata.get("bootstrap"):
+                    return runner.run(TaskSpec.model_validate(record.metadata["task_spec"]))
+                return runner.resume(run_id)
+            finally:
+                _settle_queue_and_dispatch(
+                    _root_run_id(record), run_id, record.metadata.get("task_spec", {}).get("queue_item_id")
+                )
+
+        _submit_existing(manager, run_id, "resume", execute)
         return {"run_id": run_id, "status": "queued"}
 
     @app.post("/api/runs/{run_id}/pause")
@@ -758,9 +916,15 @@ def create_app(
         return {
             "runtime": {
                 "default": settings.runtime.mode.value,
-                "modes": ["agentic", "workflow"],
+                "modes": [mode.value for mode in RuntimeMode],
                 "goal": True,
                 "automatic_context_compression": True,
+                "canonical_session": True,
+                "durable_jobs": True,
+                "continuable_agents": True,
+                "deferred_tools": settings.runtime.deferred_tools,
+                "schedules": True,
+                "plugin_trust": True,
             },
             "tools": {
                 "docker_shell": settings.shell.enabled,
@@ -777,6 +941,155 @@ def create_app(
             },
             "limits": settings.scheduler.model_dump(mode="json"),
         }
+
+    @app.get("/api/runs/{run_id}/session")
+    def task_session(run_id: str, replay: bool = False):
+        _load_record(store, run_id)
+        return store.session(run_id).replay() if replay else store.session(run_id).export()
+
+    @app.post("/api/runs/{run_id}/checkpoint")
+    def checkpoint(run_id: str):
+        _load_record(store, run_id)
+        session = store.session(run_id)
+        event = session.append("task.checkpoint", {"through_sequence": len(session.events())})
+        return event.to_dict()
+
+    @app.post("/api/runs/{run_id}/fork", status_code=202)
+    def fork_task(run_id: str, payload: FollowUpRequest):
+        selected = _load_record(store, run_id)
+        spec = _prepare_followup_spec(selected, payload.message, followup_id=uuid4().hex)
+        spec.parent_run_id = None
+        spec.root_run_id = spec.run_id
+        native = store.session(run_id).store.get(run_id)
+        if native:
+            fork = native.fork(new_session_id=spec.run_id, metadata={"lightworker_source_run": run_id})
+            # Fork history without inheriting task-local approval/control authority.
+            fork.events = [
+                e
+                for e in fork.events
+                if not e.type.startswith("lightworker.")
+                and not e.type.startswith(("job.", "agent.", "goal.", "control.", "capability."))
+            ]
+            for sequence, event in enumerate(fork.events, 1):
+                event.sequence = sequence
+                event.run_id = spec.run_id
+            store.session(spec.run_id).store.create(fork)
+            spec.conversation_context = ""
+        _submit_spec(spec, "fork")
+        return {"run_id": spec.run_id, "source_run_id": run_id}
+
+    @app.get("/api/runs/{run_id}/jobs")
+    def list_jobs(run_id: str):
+        _load_record(store, run_id)
+        return JobRegistry(store, run_id).recover()
+
+    @app.post("/api/runs/{run_id}/jobs/{job_id}")
+    def control_job(run_id: str, job_id: str, payload: ActionRequest):
+        _load_record(store, run_id)
+        registry = JobRegistry(store, run_id)
+        if registry.get(job_id)["kind"] == "task":
+            if payload.action == "resume":
+                return resume_run(run_id)
+            if payload.action == "pause":
+                return pause_run(run_id, ControlRequest(reason="paused from task Job control"))
+            if payload.action == "cancel":
+                return cancel_run(run_id, ControlRequest(reason="cancelled from task Job control"))
+            raise HTTPException(400, "unsupported task action")
+        return registry.control(job_id, payload.action)
+
+    @app.post("/api/runs/{run_id}/agents/{agent_id}/message")
+    def message_child(run_id: str, agent_id: str, payload: FollowUpRequest):
+        record = _load_record(store, run_id)
+        if record.status == RunStatus.CANCELLED:
+            raise HTTPException(409, "cancelled parent cannot accept child turns; fork a task instead")
+        active = active_agents(store, run_id)
+        if active:
+            return json.loads(active.send_message(agent_id, payload.message))
+        with store.transaction(run_id):
+            state = store.read_json(run_id, "agents.json")
+            agent = state["agents"][agent_id]
+            agent["messages"].append({"id": uuid4().hex, "message": payload.message, "status": "pending"})
+            store.write_json(run_id, "agents.json", state)
+            store.session(run_id).append("agent.message", {"agent_id": agent_id, "message": payload.message})
+            record.metadata["pending_child_turn"] = {"agent_id": agent_id, "message": payload.message}
+            store.save(record)
+        job = manager.status(run_id)
+        if record.status not in QUEUE_BLOCKING_STATUSES and not (
+            job and job["state"] in {"queued", "running"}
+        ):
+            ControlStore(store, run_id).set_state("running")
+            _submit_existing(
+                manager, run_id, "child_followup", lambda: runner_factory(settings).resume(run_id)
+            )
+            return {"queued": True, "agent_id": agent_id, "status": "resuming_parent"}
+        return {"queued": True, "agent_id": agent_id, "requires_parent_resume": True}
+
+    @app.get("/api/runs/{run_id}/evidence/{evidence_id}")
+    def read_evidence(run_id: str, evidence_id: str):
+        _load_record(store, run_id)
+        item = next((e for e in EvidenceStore(store, run_id).list() if e["evidence_id"] == evidence_id), None)
+        if item is None:
+            raise HTTPException(404, "source not found")
+        return item
+
+    @app.get("/api/runs/{run_id}/artifact-manifest")
+    def artifact_manifest(run_id: str):
+        _load_record(store, run_id)
+        return ArtifactRegistry(store, run_id).list()
+
+    @app.get("/api/schedules")
+    def list_schedules():
+        return schedules.list()
+
+    @app.post("/api/schedules", status_code=201)
+    def create_schedule(payload: ScheduleRequest):
+        return schedules.create(**payload.model_dump())
+
+    @app.post("/api/schedules/{schedule_id}")
+    def control_schedule(schedule_id: str, payload: ActionRequest):
+        return schedules.control(schedule_id, payload.action)
+
+    @app.get("/api/plugins")
+    def list_plugins():
+        return plugins.discover()
+
+    @app.get("/api/runs/{run_id}/metrics")
+    def run_metrics(run_id: str):
+        record = _load_record(store, run_id)
+        events = EventLog(store, run_id).read(limit=100000)
+        tools = [e for e in events if e["type"] in {"tool_completed", "tool_failed"}]
+        failed = [e for e in tools if e["type"] == "tool_failed"]
+        session = store.session(run_id)
+        jobs = JobRegistry(store, run_id).recover()
+        return {
+            "run_id": run_id,
+            "status": record.status.value,
+            "tool_calls": len(tools),
+            "tool_failures": len(failed),
+            "tool_seconds": round(sum(e["data"].get("elapsed_seconds", 0) for e in tools), 3),
+            "jobs": len(jobs),
+            "failed_jobs": sum(j["status"] == "failed" for j in jobs),
+            "compactions": sum(e.type == "context.compacted" for e in session.events()),
+            "pending_approvals": len(ApprovalBroker(store, run_id).pending()),
+            "evidence_count": len(EvidenceStore(store, run_id).list()),
+            "artifact_count": len(ArtifactRegistry(store, run_id).list()),
+            "session_events": len(session.events()),
+            "goal_usage": (session.state("goal.json") or {}).get("usage", {}),
+        }
+
+    @app.post("/api/plugins/trust")
+    def trust_plugin(payload: PluginTrustRequest):
+        return plugins.trust(payload.path, payload.digest)
+
+    @app.delete("/api/runs/{run_id}/queue/{item_id}")
+    def cancel_queue_message(run_id: str, item_id: str):
+        record = _load_record(store, run_id)
+        return message_queue.cancel(_root_run_id(record), item_id)
+
+    @app.post("/api/runs/{run_id}/queue/order")
+    def order_queue(run_id: str, payload: QueueOrderRequest):
+        record = _load_record(store, run_id)
+        return message_queue.reorder(_root_run_id(record), payload.item_ids)
 
     @app.get("/api/runs/{run_id}/memory")
     def list_memory(run_id: str, include_candidates: bool = True) -> list[dict[str, Any]]:
@@ -1024,7 +1337,7 @@ def _run_detail(store: RunStore, record: RunRecord, job: dict[str, Any] | None) 
         "follow-up-answer",
     }
     execution_mode = record.metadata.get("execution_mode")
-    payload["unified_mode"] = execution_mode in {"unified", "agentic"}
+    payload["unified_mode"] = execution_mode in {"unified", "agentic", "code", "minimal", "ralph"}
     payload["general_only"] = execution_mode in {"general", "analysis"}
     payload["analysis_only"] = execution_mode == "analysis"
     payload["goal"] = _read_optional_json(store, record.run_id, "goal.json")
@@ -1055,7 +1368,11 @@ def _conversation_turn(store: RunStore, record: RunRecord) -> dict[str, Any]:
             "source_mode": _source_mode(record),
             "summary": summary,
             "diff": _read_optional_text(store, record.run_id, "changes.patch"),
-            "citations": _extract_citations(activity, summary),
+            "citations": [
+                {**e, "url": e["url"] or f"/api/runs/{record.run_id}/evidence/{e['evidence_id']}"}
+                for e in EvidenceStore(store, record.run_id).list()
+            ]
+            or _extract_citations(activity, summary),
         }
     )
 
@@ -1270,7 +1587,8 @@ def _migrate_legacy_credentials(store: RunStore, state_dir: Path) -> None:
 def _recover_stale_runs(store: RunStore, manager: TaskManagerProtocol) -> None:
     """Turn process-orphaned active records into explicit resumable checkpoints."""
     for record in store.list():
-        if record.status not in ACTIVE_STATUSES or manager.status(record.run_id) is not None:
+        job = manager.status(record.run_id)
+        if record.status not in ACTIVE_STATUSES or (job and job.get("state") in {"queued", "running"}):
             continue
         record.status = RunStatus.INTERRUPTED
         record.error = "LightWorker service restarted; this task can be resumed from its durable workspace."
@@ -1343,11 +1661,8 @@ def _source_mode(record: RunRecord) -> str:
 
 
 def _load_flow_record(store: RunStore, run_id: str) -> dict[str, Any]:
-    path = store.artifact_path(run_id, f"flow/{run_id}.json")
-    if not path.is_file():
-        return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = store.read_json(run_id, f"flow/{run_id}.json")
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
@@ -1662,16 +1977,16 @@ def _has_text_artifact(store: RunStore, run_id: str, name: str) -> bool:
 
 
 def _read_optional_json(store: RunStore, run_id: str, name: str) -> Any | None:
-    path = store.artifact_path(run_id, name)
-    if not path.is_file():
-        return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return store.read_json(run_id, name)
     except (OSError, json.JSONDecodeError):
         return None
 
 
 def _read_optional_text(store: RunStore, run_id: str, name: str) -> str:
+    projected = store.session(run_id).state(f"artifact:{name}")
+    if isinstance(projected, str):
+        return projected
     path = store.artifact_path(run_id, name)
     if not path.is_file():
         return ""

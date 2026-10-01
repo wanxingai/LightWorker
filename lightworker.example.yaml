@@ -12,6 +12,11 @@ runtime:
   context_window_tokens: 64000
   compression_ratio: 0.75
   no_progress_limit: 4
+  # Profiles are execution strategies, not task categories: agentic/workflow/code/minimal/ralph.
+  deferred_tools: true
+  ralph_rounds: 3
+  background_wait_seconds: 900
+  workflow_presets: {}
   goal_budget:
     max_turns: 24
     max_tool_calls: 80
@@ -97,6 +102,13 @@ mcp:
   #     transport: stdio
   #     command: python
   #     args: [-m, my_mcp_server]
+
+plugins:
+  # plugin.json contributes skills, namespaced MCP servers and workflow presets.
+  # New or changed plugins stay disabled until explicitly trusted in the UI.
+  directories: [~/.lightworker/plugins]
+  # Ed25519 public keys (base64). Install --extra signing for signature enforcement.
+  trusted_public_keys: []
 
 rag:
   enabled: true

@@ -6,9 +6,9 @@
     <meta name="color-scheme" content="light" />
     <title>LightWorker</title>
     <meta name="description" content="以聊天方式提交并观察通用任务。" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260811-6" />
-    <script src="/static/markdown.js?v=20260811-6" defer></script>
-    <script src="/static/app.js?v=20260811-6" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=0.5.0" />
+    <script src="/static/markdown.js?v=0.5.0" defer></script>
+    <script src="/static/app.js?v=0.5.0" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -122,6 +122,14 @@
                           <button class="text-button" id="loadResourcesButton" type="button">加载资源</button>
                         </div>
                       </details>
+                      <details id="jobsPanel" class="is-hidden">
+                        <summary>后台任务与子 Agent</summary>
+                        <div class="resource-manager" id="jobsContent"></div>
+                      </details>
+                      <details id="artifactPanel" class="is-hidden">
+                        <summary>产物、证据与运行轨迹</summary>
+                        <div class="resource-manager" id="artifactContent"></div>
+                      </details>
                     </div>
                     <div class="verification-card is-hidden" id="verificationCard"></div>
                     <div class="run-error is-hidden" id="runError"></div>
@@ -198,6 +206,9 @@
                 <select id="runtimeModeInput">
                   <option value="agentic" selected>动态 Agentic Loop</option>
                   <option value="workflow">固定 Workflow</option>
+                  <option value="code">Code Mode · Docker 工具编排</option>
+                  <option value="minimal">Minimal · 精简工具</option>
+                  <option value="ralph">Ralph · 验证驱动迭代</option>
                 </select>
                 <small>同一入口支持任意任务；Workflow 仅用于需要固定阶段的场景</small>
               </label>

@@ -4,10 +4,20 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from functools import wraps
 
 from .models import GoalBudget, GoalState, GoalStatus, Subgoal, SubgoalStatus, ToolCategory
 from .storage import RunStore
 from .tool_protocol import tool_info
+
+
+def atomic_goal(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self.store.transaction(self.run_id):
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 class GoalManager:
@@ -15,6 +25,7 @@ class GoalManager:
         self.store = store
         self.run_id = run_id
 
+    @atomic_goal
     def create(
         self,
         objective: str,
@@ -22,9 +33,10 @@ class GoalManager:
         acceptance_criteria: list[str] | None = None,
         budget: GoalBudget | None = None,
     ) -> GoalState:
-        path = self.store.artifact_path(self.run_id, "goal.json")
-        if path.is_file():
+        try:
             return self.load()
+        except FileNotFoundError:
+            pass
         goal = GoalState(
             run_id=self.run_id,
             objective=objective,
@@ -42,12 +54,14 @@ class GoalManager:
         self.store.write_json(self.run_id, "goal.json", goal.model_dump(mode="json"))
         return goal
 
+    @atomic_goal
     def update_status(self, status: GoalStatus, reason: str | None = None) -> GoalState:
         goal = self.load()
         goal.status = status
         goal.waiting_reason = reason
         return self.save(goal)
 
+    @atomic_goal
     def add_subgoal(self, objective: str, owner: str | None = None) -> Subgoal:
         goal = self.load()
         subgoal = Subgoal(objective=objective, owner=owner)
@@ -55,6 +69,7 @@ class GoalManager:
         self.save(goal)
         return subgoal
 
+    @atomic_goal
     def update_subgoal(
         self,
         subgoal_id: str,
@@ -70,6 +85,7 @@ class GoalManager:
         self.save(goal)
         return subgoal
 
+    @atomic_goal
     def add_usage(
         self,
         *,

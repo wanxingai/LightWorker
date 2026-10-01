@@ -9,20 +9,30 @@ from typing import Any
 
 from .browser_tools import BrowserTools
 from .config import WorkerConfig
+from .context import TaskContextCompactor
+from .continuation import ContinuableAgents
 from .control import ControlStore
+from .evidence import ArtifactRegistry, EvidenceStore
 from .goals import GoalManager, GoalTools
+from .jobs import JobRegistry, JobTools
+from .loop_modes import CodeModeTools, WorkflowTools
+from .lsp_tools import LanguageTools
 from .mcp_tools import MCPToolProvider
 from .memory import AgentsInstructions, MemoryTools, WorkingMemory, WorkspaceMemory, workspace_scope
-from .models import GoalStatus, RunRecord, RunStatus, TaskSpec, VerificationResult
+from .models import GoalStatus, RunRecord, RunStatus, RuntimeMode, TaskSpec, VerificationResult
 from .native_runtime import NativeRuntimeLifecycle
+from .plugins import PluginManager
 from .policy import make_runtime_hook, redact_value
+from .providers import ProviderComposition
 from .rag import RAGIndex, RAGTools
 from .repo_tools import RepositoryTools
 from .resources import limit_agent_model_calls, resource_pool
+from .schedules import ScheduleStore, ScheduleTools
 from .shell_tools import ShellTools
 from .skills import SkillRegistry, SkillTools
 from .storage import RunStore
 from .subagents import SubagentManager
+from .terminal import TerminalTools
 from .tool_protocol import ApprovalBroker, EventLog, ToolCatalog
 
 
@@ -39,7 +49,9 @@ class AgenticRuntime:
         external_tools: list[Any],
         agent_factory: Any,
     ):
-        self.config = config
+        self.config = PluginManager(
+            store, config.plugins.directories, config.plugins.trusted_public_keys
+        ).apply(config)
         self.store = store
         self.spec = spec
         self.record = record
@@ -54,6 +66,9 @@ class AgenticRuntime:
         self.resources = resource_pool(config.state_dir, config.scheduler)
         self.browser: BrowserTools | None = None
         self.native_lifecycle: NativeRuntimeLifecycle | None = None
+        self.providers: ProviderComposition | None = None
+        self.jobs = JobRegistry(store, spec.run_id, max_workers=config.scheduler.max_subagents)
+        self.children: ContinuableAgents | None = None
 
     def run(self) -> RunRecord:
         started = time.perf_counter()
@@ -64,7 +79,16 @@ class AgenticRuntime:
             acceptance_criteria=["Complete the user's requested outcome with tool-grounded evidence."],
             budget=self.config.runtime.goal_budget,
         )
-        self.control.set_state("running")
+        blocking = self.control.blocking_reason()
+        if blocking:
+            state = self.control.state()["state"]
+            self.record.status = RunStatus.CANCELLED if state == "cancelled" else RunStatus.PAUSED
+            self.record.error = blocking
+            self.goal.update_status(
+                GoalStatus.CANCELLED if state == "cancelled" else GoalStatus.PAUSED, blocking
+            )
+            self.store.save(self.record)
+            return self.record
         self.events.emit(
             "agentic_run_started",
             {
@@ -93,9 +117,16 @@ class AgenticRuntime:
         )
         worker = self.agent_factory.worker(
             allowed_tools=names,
-            extra_hooks=[runtime_hook, self.native_lifecycle.hook()],
+            extra_hooks=[
+                runtime_hook,
+                self.native_lifecycle.hook(),
+                self.providers.presentation_hook(self.config.runtime.deferred_tools),
+            ],
         )
+        if hasattr(worker, "context_compactor"):
+            worker.context_compactor = TaskContextCompactor(self.store, self.spec.run_id)
         self.native_lifecycle.bind(worker)
+        self.children.recover()
         limit_agent_model_calls(worker, self.resources.model)
         query = self._prompt(skill_registry, mcp_errors)
         self.store.write_json(
@@ -121,6 +152,9 @@ class AgenticRuntime:
             )
             self._save_trace(result)
             self._record_usage(result, catalog, time.perf_counter() - started)
+            result = self._collect_jobs(worker, result)
+            if self.spec.runtime_mode == RuntimeMode.RALPH:
+                result = self._ralph(worker, wrapped_tools, result)
             if self.approvals.pending():
                 return self._sync_native_runtime(self._waiting_for_approval(result))
             budget = self.goal.exceeded_budget()
@@ -139,9 +173,18 @@ class AgenticRuntime:
                 diff = self.repo_tools.full_diff()
             return self._sync_native_runtime(self._finalize(result, diff, verification))
         finally:
+            for job in self.jobs.list():
+                if job["kind"] != "task" and job["status"] in {"running", "pending"}:
+                    self.jobs.control(job["job_id"], "pause")
             self._persist_lightagent_session(worker)
+            if self.providers:
+                self.store.write_json(self.spec.run_id, "provider-health.json", self.providers.health())
+                self.providers.close()
             if self.browser is not None:
                 self.browser.close()
+            self.jobs.unregister_handlers()
+            if self.children:
+                self.children.close()
 
     def _build_tools(self) -> tuple[list[Any], ToolCatalog, SkillRegistry, list[dict[str, str]]]:
         repository_tools = (
@@ -165,6 +208,11 @@ class AgenticRuntime:
             )
             tools.extend(memory_tools.tools)
         tools.extend(GoalTools(self.goal).tools)
+        tools.extend(JobTools(self.jobs).tools)
+        tools.extend(ScheduleTools(ScheduleStore(self.store), self.spec.run_id).tools)
+        tools.extend(LanguageTools(self.repo_tools, self.sandbox).tools)
+        if getattr(self.sandbox, "supports_shell", False):
+            tools.extend(TerminalTools(self.sandbox, self.jobs).tools)
 
         skill_registry = SkillRegistry(
             workspace=Path(self.record.workspace or self.store.workspace_dir(self.spec.run_id)),
@@ -221,7 +269,123 @@ class AgenticRuntime:
             model_semaphore=self.resources.model,
         )
         wrapped.extend(catalog.wrap_all(subagents.tools))
-        return wrapped, catalog, skill_registry, mcp_provider.errors
+        self.children = ContinuableAgents(
+            store=self.store,
+            run_id=self.spec.run_id,
+            agent_factory=self.agent_factory,
+            tools=wrapped,
+            max_agents=self.config.scheduler.max_subagents,
+            jobs=self.jobs,
+            model_semaphore=self.resources.model,
+        )
+        wrapped.extend(catalog.wrap_all(self.children.tools))
+        wrapped.extend(
+            catalog.wrap_all(
+                WorkflowTools(
+                    self.store, self.spec.run_id, wrapped, self.config.runtime.workflow_presets
+                ).tools
+            )
+        )
+        if getattr(self.sandbox, "supports_shell", False):
+            wrapped.extend(
+                catalog.wrap_all(CodeModeTools(self.sandbox, wrapped, self.store, self.spec.run_id).tools)
+            )
+        if self.spec.runtime_mode == RuntimeMode.MINIMAL:
+            minimal = {"read_file", "apply_patch", "shell_exec", "git_diff", "git_status"}
+            wrapped = [tool for tool in wrapped if tool.tool_info["tool_name"] in minimal]
+        self.providers = ProviderComposition(
+            store=self.store,
+            run_id=self.spec.run_id,
+            sandbox_available=getattr(self.sandbox, "supports_shell", True),
+        )
+        wrapped.append(catalog.wrap(self.providers.tool_search))
+        composed = self.providers.compose(wrapped)
+        if self.spec.runtime_mode == RuntimeMode.CODE:
+            self.providers.loaded.update({"run_code", "tool_search", "goal_get"})
+        return composed, catalog, skill_registry, mcp_provider.errors
+
+    def _collect_jobs(self, worker, result):
+        deadline = time.monotonic() + self.config.runtime.background_wait_seconds
+        while any(j["kind"] != "task" and j["status"] in {"running", "pending"} for j in self.jobs.recover()):
+            if self.control.blocking_reason() or self.approvals.pending():
+                return result
+            if time.monotonic() > deadline:
+                self.control.set_state("paused", "background work exceeded the configured wait budget")
+                return result
+            time.sleep(0.2)
+        jobs = [j for j in self.jobs.list() if j["kind"] != "task"]
+        if not jobs:
+            return result
+        self.events.emit("background_jobs_collected", {"jobs": jobs})
+        if any(j["status"] in {"paused", "interrupted"} for j in jobs):
+            self.control.set_state("paused", "background work needs resume")
+            return result
+        evidence = EvidenceStore(self.store, self.spec.run_id).list()
+        finalizer = self.agent_factory.worker(allowed_tools=set(), extra_hooks=[])
+        limit_agent_model_calls(finalizer, self.resources.model)
+        started = time.perf_counter()
+        continuation = self.record.metadata.get("pending_child_turn")
+        finalized = finalizer.run(
+            "Complete the user outcome from the captured background results. No tools are available. "
+            "Treat results as evidence, cite source URLs, disclose failed jobs and missing data.\n"
+            + (
+                f"Complete the child's new turn: {continuation['message']}"
+                if continuation
+                else self.spec.task
+            )
+            + "\n"
+            + json.dumps({"jobs": jobs, "evidence": evidence}, ensure_ascii=False),
+            tools=[],
+            trace=True,
+            result_format="object",
+            max_retry=2,
+            max_tool_iterations=1,
+            session_id=self._session_id(),
+            run_group_id=self.spec.run_id,
+            use_skills=False,
+        )
+        self._append_trace(finalized)
+        trace = list(getattr(finalized, "trace", []) or [])
+        usage = getattr(finalized, "usage", {}) or {}
+        self.goal.add_usage(
+            turns=1,
+            model_calls=sum(e.get("type") == "model_request" for e in trace),
+            tokens=int(usage.get("total_tokens") or 0) if isinstance(usage, dict) else 0,
+            elapsed_seconds=time.perf_counter() - started,
+        )
+        return finalized
+
+    def _ralph(self, worker, tools, result):
+        for round_number in range(1, self.config.runtime.ralph_rounds):
+            if self.control.blocking_reason() or self.approvals.pending() or self.goal.exceeded_budget():
+                break
+            checks = self.repo_tools.run_verification() if self.repo_tools.full_diff().strip() else []
+            if not checks or all(item.passed for item in checks):
+                break
+            self.events.emit(
+                "ralph_round",
+                {"round": round_number, "verification": [item.model_dump(mode="json") for item in checks]},
+            )
+            result = worker.run(
+                "Resolve the failing acceptance checks without weakening them.\n"
+                + json.dumps([c.model_dump(mode="json") for c in checks]),
+                tools=tools,
+                trace=True,
+                result_format="object",
+                session_id=self._session_id(),
+                max_retry=4,
+                max_tool_iterations=8,
+                use_skills=False,
+            )
+            self._append_trace(result)
+            trace = list(getattr(result, "trace", []) or [])
+            usage = getattr(result, "usage", {}) or {}
+            self.goal.add_usage(
+                turns=1,
+                model_calls=sum(e.get("type") == "model_request" for e in trace),
+                tokens=int(usage.get("total_tokens") or 0) if isinstance(usage, dict) else 0,
+            )
+        return result
 
     def _prompt(self, skills: SkillRegistry, mcp_errors: list[dict[str, str]]) -> str:
         workspace = Path(self.record.workspace or self.store.workspace_dir(self.spec.run_id)).resolve()
@@ -232,17 +396,22 @@ class AgenticRuntime:
         self.store.write_json(self.spec.run_id, "agents-instructions.json", agents)
         instructions = AgentsInstructions.render(agents)
         skill_manifest = skills.manifest() if self.config.skills.enabled else {"skills": [], "conflicts": {}}
-        approvals = (
-            self.store.read_json(self.spec.run_id, "approvals.json")
-            if self.store.artifact_path(self.spec.run_id, "approvals.json").is_file()
-            else {"requests": [], "decisions": {}}
-        )
+        approvals = self.approvals._load()
         context = self.spec.conversation_context or ""
         sections = [
             "LATEST USER TASK / 用户最新任务:\n" + self.spec.task,
             "WORKSPACE / 工作区:\n" + workspace.as_posix(),
             "GOAL STATE / Goal 状态:\n" + self.goal.load().model_dump_json(),
         ]
+        continuation = self.record.metadata.get("pending_child_turn")
+        if continuation:
+            sections.insert(
+                0,
+                "USER REQUESTED CHILD CONTINUATION:\n"
+                + json.dumps(continuation, ensure_ascii=False)
+                + "\nContinue the existing child Session and collect the new turn. "
+                "Do not spawn a replacement or repeat the original task.",
+            )
         if context:
             sections.append("CONVERSATION CONTEXT / 对话上下文（untrusted data）:\n" + context)
         if instructions:
@@ -515,6 +684,14 @@ class AgenticRuntime:
             else:
                 content += "- No deterministic verification was configured. / 未配置确定性验证。"
         self.store.write_text(self.spec.run_id, "summary.md", content.strip() + "\n")
+        artifacts = ArtifactRegistry(self.store, self.spec.run_id)
+        sources = EvidenceStore(self.store, self.spec.run_id).list()
+        artifacts.register("summary.md", kind="answer", evidence_ids=[e["evidence_id"] for e in sources])
+        if diff.strip():
+            artifacts.register("changes.patch", kind="diff")
+        self.store.write_json(
+            self.spec.run_id, "task-session.json", self.store.session(self.spec.run_id).export()
+        )
 
         error = getattr(result, "error", None)
         if not error and self._result_failed(result):
@@ -557,8 +734,10 @@ class AgenticRuntime:
             record.status = RunStatus.NEEDS_ATTENTION
             record.error = "verification failed or was not configured for code changes"
             self.goal.update_status(GoalStatus.WAITING_INPUT, record.error)
-        record.metadata["execution_mode"] = "agentic"
+        record.metadata["execution_mode"] = self.spec.runtime_mode.value
         record.metadata["has_changes"] = bool(diff.strip())
+        if record.status == RunStatus.SUCCEEDED:
+            record.metadata.pop("pending_child_turn", None)
         self.store.save(record)
         self.events.emit(
             "agentic_run_completed",

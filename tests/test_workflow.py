@@ -8,6 +8,7 @@ from LightAgent import RunResult
 
 from lightworker.config import WorkerConfig
 from lightworker.models import InstalledRequirement, RunStatus, TaskSpec, VerificationCommand
+from lightworker.tool_protocol import ApprovalBroker
 from lightworker.workflow import (
     CodingTaskRunner,
     _approve_edit_by_risk,
@@ -135,6 +136,40 @@ class FakeAgentFactory:
 
     def reviewer(self, **kwargs: Any):
         return ReviewerAgent()
+
+
+def test_fixed_workflow_uses_exact_tool_approvals(git_repo: Path, tmp_path: Path):
+    class PipCoder(CoderAgent):
+        def run(self, query, **kwargs):
+            install = next(t for t in kwargs["tools"] if t.tool_info["tool_name"] == "pip_install")
+            response = json.loads(install(requirements=["fixture-package==1.0"]))
+            if response.get("approval_required"):
+                return RunResult(content="waiting for install")
+            return super().run(query, **kwargs)
+
+    class Factory(FakeAgentFactory):
+        def coder(self, **kwargs):
+            return PipCoder()
+
+    FakeSandbox.instances.clear()
+    runner = CodingTaskRunner(
+        WorkerConfig(state_dir=tmp_path / "state", model={"model": "fake"}),
+        agent_factory=Factory(),
+        sandbox_factory=FakeSandbox,
+    )
+    spec = TaskSpec(
+        repo=git_repo,
+        task="Install and fix",
+        max_repairs=0,
+        verification=[VerificationCommand(name="test", argv=["pytest", "-q"])],
+    )
+    waiting = runner.run(spec)
+    assert waiting.status == RunStatus.WAITING_APPROVAL
+    assert not FakeSandbox.instances[0].installs
+    request = ApprovalBroker(runner.store, spec.run_id).pending()[0]
+    resumed = runner.decide_approval(spec.run_id, request["request_id"], "approved")
+    assert FakeSandbox.instances[-1].installs == [["fixture-package==1.0"]]
+    assert resumed.status != RunStatus.WAITING_APPROVAL
 
 
 def test_full_flow_repairs_failed_verification_and_preserves_source(git_repo: Path, tmp_path: Path):

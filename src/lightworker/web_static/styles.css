@@ -2057,3 +2057,16 @@ select:focus-visible {
     grid-template-columns: 1fr;
   }
 }
+.source-document {
+  max-height: min(45vh, 360px);
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.resource-ingest input[type="datetime-local"] {
+  min-width: 160px;
+  flex: 0 1 auto;
+  color-scheme: dark;
+}

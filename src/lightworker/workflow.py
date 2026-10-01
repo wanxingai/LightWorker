@@ -25,16 +25,49 @@ from .policy import redact_value
 from .repo_tools import RepositoryTools, update_install_record
 from .resources import resource_pool
 from .sandbox import DockerSandbox, ReadOnlyWorkspaceSandbox, SandboxBackend, SandboxError
+from .sessions import SessionFlowStore
 from .storage import RunStore
-from .tool_protocol import ApprovalBroker, EventLog
+from .tool_protocol import ApprovalBroker, EventLog, ToolCatalog, metadata_for
 from .workspace import WorkspaceManager
 
 try:
-    from LightAgent import ApprovalDecision, JsonLightFlowStore, LightFlow
+    from LightAgent import ApprovalDecision, JsonLightFlowStore, LightFlow, RunResult
 except ImportError:  # pragma: no cover
     ApprovalDecision = None  # type: ignore[assignment]
     JsonLightFlowStore = None  # type: ignore[assignment]
     LightFlow = None  # type: ignore[assignment]
+
+
+_SKIP_STEP = "LIGHTWORKER_SKIP_STEP\n"
+
+
+class _ConditionalStep:
+    """Skip optional repair work without cancelling the whole LightFlow in 0.11."""
+
+    def __init__(self, agent):
+        self.agent = agent
+        self.name = getattr(agent, "name", "OptionalStep")
+
+    def run(self, query, **kwargs):
+        if query.startswith(_SKIP_STEP):
+            return RunResult(content=query.removeprefix(_SKIP_STEP))
+        return self.agent.run(query, **kwargs)
+
+
+class _FlowToolApprovalAgent:
+    def __init__(self, agent, broker):
+        self.agent, self.broker = agent, broker
+        self.name = getattr(agent, "name", "execute")
+
+    def run(self, *args, **kwargs):
+        result = self.agent.run(*args, **kwargs)
+        if self.broker.pending():
+            return RunResult(
+                content=str(getattr(result, "content", result)),
+                error="waiting for exact tool approval",
+                trace=list(getattr(result, "trace", []) or []),
+            )
+        return result
 
 
 class CodingTaskRunner:
@@ -64,7 +97,15 @@ class CodingTaskRunner:
             repo=str(spec.repo.expanduser().resolve()),
             metadata={"task_spec": spec.model_dump(mode="json")},
         )
-        self.store.create(record)
+        with self.store.transaction(spec.run_id):
+            try:
+                previous = self.store.load(spec.run_id)
+            except FileNotFoundError:
+                self.store.create(record)
+            else:
+                if not previous.metadata.get("bootstrap"):
+                    raise FileExistsError(f"run already exists: {spec.run_id}")
+                self.store.save(record)
         try:
             self.store.update_status(spec.run_id, RunStatus.PREPARING, current_step="workspace")
             workspace = self.store.workspace_dir(spec.run_id)
@@ -84,6 +125,11 @@ class CodingTaskRunner:
 
     def resume(self, run_id: str) -> RunRecord:
         record = self.store.load(run_id)
+        from .control import ControlStore
+
+        if record.status == RunStatus.CANCELLED:
+            raise ValueError("cancelled tasks cannot resume; submit a follow-up instead")
+        ControlStore(self.store, run_id).set_state("running")
         spec = TaskSpec.model_validate(record.metadata["task_spec"])
         workspace = Path(record.workspace or self.store.workspace_dir(run_id))
         if not workspace.is_dir():
@@ -138,7 +184,7 @@ class CodingTaskRunner:
     ) -> RunRecord:
         workspace = Path(record.workspace or self.store.workspace_dir(spec.run_id)).resolve()
         image = spec.image or self.config.image
-        use_agentic = spec.runtime_mode == RuntimeMode.AGENTIC and hasattr(self.agent_factory, "worker")
+        use_agentic = spec.runtime_mode != RuntimeMode.WORKFLOW and hasattr(self.agent_factory, "worker")
         sandbox_factory = self.sandbox_factory
         degraded_reason: str | None = None
         if sandbox_factory is DockerSandbox and use_agentic and not DockerSandbox.daemon_available():
@@ -219,18 +265,18 @@ class CodingTaskRunner:
             flow = self._build_flow(spec, tools, external_tool_list)
             if approval:
                 step_name, action, note = approval
-                if ApprovalDecision is None:
-                    raise RuntimeError("LightAgent approval API is unavailable")
-                decision = (
-                    ApprovalDecision.approve(reason=note or None, reviewer_id="lightworker-web")
-                    if action == "approved"
-                    else ApprovalDecision.reject(
-                        reason=note or "用户拒绝了该操作",
-                        reviewer_id="lightworker-web",
-                    )
+                broker = ApprovalBroker(self.store, spec.run_id, EventLog(self.store, spec.run_id))
+                tool_request = next(
+                    (r for r in broker._load()["requests"] if r["request_id"] == step_name), None
                 )
-                flow.approve(spec.run_id, step_name, decision)
-                result = flow.resume(spec.run_id, trace=True, result_format="object")
+                if tool_request:
+                    broker.decide(step_name, action, note)
+                    checkpoint = self.store.read_json(spec.run_id, "workflow-tool-resume.json")
+                    result = flow.rerun_step(
+                        spec.run_id, checkpoint["step"], trace=True, result_format="object"
+                    )
+                else:
+                    result = self._approve_flow_step(flow, spec.run_id, step_name, action, note)
             elif rerun_step:
                 result = flow.rerun_step(spec.run_id, rerun_step, trace=True, result_format="object")
             elif resume:
@@ -241,6 +287,19 @@ class CodingTaskRunner:
                     run_id=spec.run_id,
                     trace=True,
                     result_format="object",
+                )
+            pending = ApprovalBroker(self.store, spec.run_id).pending()
+            if pending:
+                failed_step = next(
+                    (s.name for s in reversed(result.steps) if s.status == "failed"), "execute"
+                )
+                self.store.write_json(spec.run_id, "workflow-tool-resume.json", {"step": failed_step})
+                self._save_trace(spec.run_id, result)
+                return self.store.update_status(
+                    spec.run_id,
+                    RunStatus.WAITING_APPROVAL,
+                    current_step=f"approval:{pending[0]['request_id']}",
+                    error="等待精确工具审批",
                 )
             if getattr(result, "status", None) == "waiting_approval":
                 self._save_trace(spec.run_id, result)
@@ -276,24 +335,51 @@ class CodingTaskRunner:
             }
         )
 
+    @staticmethod
+    def _approve_flow_step(flow, run_id, step_name, action, note):
+        if ApprovalDecision is None:
+            raise RuntimeError("LightAgent approval API is unavailable")
+        decision = (
+            ApprovalDecision.approve(reason=note or None, reviewer_id="lightworker-web")
+            if action == "approved"
+            else ApprovalDecision.reject(reason=note or "用户拒绝了该操作", reviewer_id="lightworker-web")
+        )
+        flow.approve(run_id, step_name, decision)
+        return flow.resume(run_id, trace=True, result_format="object")
+
     def _build_flow(
         self,
         spec: TaskSpec,
         tools: RepositoryTools,
         external_tools: list[Any] | None = None,
     ) -> Any:
-        flow_store = JsonLightFlowStore(self.store.run_dir(spec.run_id) / "flow")
+        flow_store = SessionFlowStore(self.store)
         external_tools = list(external_tools or [])
-        read_tools = [*tools.read_tools, *external_tools]
-        execute_tools = [*tools.write_tools, *external_tools]
+        events = EventLog(self.store, spec.run_id)
+        broker = ApprovalBroker(self.store, spec.run_id, events)
+        from .control import ControlStore
+
+        catalog = ToolCatalog(
+            broker=broker,
+            events=events,
+            control_check=ControlStore(self.store, spec.run_id).blocking_reason,
+            max_tool_calls=self.config.runtime.goal_budget.max_tool_calls,
+            max_repeat_calls=self.config.runtime.no_progress_limit,
+        )
+        read_tools = catalog.wrap_all(
+            [*tools.read_tools, *[t for t in external_tools if metadata_for(t).is_read_only]]
+        )
+        execute_tools = catalog.wrap_all([*tools.write_tools, *external_tools])
+        review_tools = catalog.wrap_all(tools.review_tools)
         read_names = _tool_names(read_tools)
         execute_names = _tool_names(execute_tools)
-        review_names = _tool_names(tools.review_tools)
+        review_names = _tool_names(review_tools)
         planner = self.agent_factory.planner(allowed_tools=read_names)
         if hasattr(self.agent_factory, "executor"):
             executor = self.agent_factory.executor(allowed_tools=execute_names)
         else:
             executor = self.agent_factory.coder(allowed_tools=execute_names)
+        executor = _FlowToolApprovalAgent(executor, broker)
         reviewer_base = self.agent_factory.reviewer(allowed_tools=review_names)
         plan_agent = StructuredOutputAgent(planner, CodingPlan, strict=True)
         reviewer = StructuredOutputAgent(reviewer_base, ReviewReport, strict=False)
@@ -351,22 +437,26 @@ class CodingTaskRunner:
             verify_name = f"verify_{attempt}"
             flow.step(
                 repair_name,
-                agent=executor,
+                agent=_ConditionalStep(executor),
                 depends_on=[previous_verify],
                 tools=execute_tools,
-                query=lambda ctx, name=previous_verify, number=attempt: _repair_query(
-                    spec, ctx, name, number
+                query=lambda ctx, name=previous_verify, number=attempt: (
+                    _SKIP_STEP + "Repair skipped: verification already passed or was not configured."
+                    if _skip_repair(ctx, name)
+                    else _repair_query(spec, ctx, name, number)
                 ),
-                cancel_if=lambda ctx, name=previous_verify: _skip_repair(ctx, name),
                 timeout=900,
             )
             flow.step(
                 verify_name,
-                agent=verifier,
+                agent=_ConditionalStep(verifier),
                 depends_on=[repair_name],
                 tools=[],
-                query="Re-run the configured deterministic verification commands after repair.",
-                cancel_if=lambda ctx, name=previous_verify: _skip_repair(ctx, name),
+                query=lambda ctx, name=previous_verify: (
+                    _SKIP_STEP + json.dumps(_verification_payload(ctx, name))
+                    if _skip_repair(ctx, name)
+                    else "Re-run the configured deterministic verification commands after repair."
+                ),
                 timeout=self.config.limits.command_timeout_seconds * max(len(spec.verification), 1),
             )
             previous_verify = verify_name
@@ -374,7 +464,7 @@ class CodingTaskRunner:
             "review",
             agent=reviewer,
             depends_on=[previous_verify],
-            tools=tools.review_tools,
+            tools=review_tools,
             query=lambda ctx: _review_query(spec, ctx),
             timeout=600,
         )

@@ -89,6 +89,33 @@ function enhanceCitations(element, citations) {
   const values = Array.isArray(citations) ? citations : [];
   const byUrl = new Map(values.map((item) => [canonicalSourceUrl(item.url), item]).filter(([url]) => url));
   const used = new Set();
+  const byIdMap = new Map(values.flatMap((item) => [[String(item.id), item], [item.evidence_id, item]]));
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      return node.parentElement.closest("pre, code, a, button")
+        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach((node) => {
+    const pattern = /\[(E?\d+)\]/g;
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+    let matched = false;
+    for (const match of node.textContent.matchAll(pattern)) {
+      const source = byIdMap.get(match[1]);
+      if (!source) continue;
+      fragment.append(node.textContent.slice(cursor, match.index), citationButton(source));
+      cursor = match.index + match[0].length;
+      used.add(source.id);
+      matched = true;
+    }
+    if (matched) {
+      fragment.append(node.textContent.slice(cursor));
+      node.replaceWith(fragment);
+    }
+  });
   const anchors = [...element.querySelectorAll('a[href^="http://"], a[href^="https://"]')];
   anchors.forEach((anchor) => {
     const url = canonicalSourceUrl(anchor.href);
@@ -131,6 +158,17 @@ function showCitationPopover(button, citation) {
   byId("citationMeta").textContent = [citation.site || "引用来源", sourceDate].filter(Boolean).join(" · ");
   byId("citationTitle").textContent = citation.title || citation.site || "引用文档";
   byId("citationExcerpt").textContent = citation.excerpt || "该来源没有可展示的内容摘要，请打开原文查看。";
+  if (citation.evidence_id && state.currentRunId) {
+    const content = byId("citationExcerpt");
+    const read = resourceButton("查看已捕获文档", async () => {
+      const source = await api(`/api/runs/${encodeURIComponent(state.currentRunId)}/evidence/${encodeURIComponent(citation.evidence_id)}`);
+      const documentText = document.createElement("pre");
+      documentText.className = "source-document";
+      documentText.textContent = source.content || "未捕获正文（仅搜索线索）。";
+      content.replaceChildren(documentText);
+    });
+    content.append(document.createElement("br"), read);
+  }
   byId("citationLink").href = citation.url;
   popover.classList.remove("is-hidden");
   window.requestAnimationFrame(() => {
@@ -313,6 +351,29 @@ function elapsedDuration(value) {
 }
 
 function runElapsedMilliseconds(run, now = Date.now()) {
+  // A resumed child turn shares the run ID, but idle time between activations
+  // is not processing time. Sum the persisted execution intervals instead.
+  let total = 0;
+  let intervalStart = null;
+  let hasIntervals = false;
+  for (const event of run?.events || []) {
+    const timestamp = Date.parse(event.timestamp || "");
+    if (Number.isNaN(timestamp)) continue;
+    if (event.type === "agentic_run_started") {
+      hasIntervals = true;
+      intervalStart = timestamp;
+    } else if (event.type === "agentic_run_completed" && intervalStart !== null) {
+      total += Math.max(0, timestamp - intervalStart);
+      intervalStart = null;
+    }
+  }
+  if (hasIntervals) {
+    if (intervalStart !== null) {
+      const end = isBusy(run) ? now : Date.parse(run?.updated_at || "");
+      total += Math.max(0, (Number.isNaN(end) ? intervalStart : end) - intervalStart);
+    }
+    return total;
+  }
   const startedAt = Date.parse(run?.created_at || "");
   if (Number.isNaN(startedAt)) return 0;
   const active = isBusy(run) || Boolean(run?.approval_request);
@@ -497,6 +558,7 @@ async function renderRun(run, { forceScroll = false } = {}) {
 
   renderActions(run);
   renderRuntimeInspector(run);
+  renderBackgroundWork(run);
   renderActivity(run.activity || [], run);
   renderVerification(isBusy(run) ? [] : (run.verification || []));
   renderError(run);
@@ -580,15 +642,95 @@ function renderRuntimeInspector(run) {
   }
 }
 
+function renderBackgroundWork(run) {
+  const jobs = Array.isArray(run.jobs) ? run.jobs.filter((job) => job.kind !== "task") : [];
+  const agents = Array.isArray(run.continuable_agents) ? run.continuable_agents : [];
+  const panel = byId("jobsPanel");
+  const root = byId("jobsContent");
+  if (root.contains(document.activeElement) && document.activeElement.matches("input, textarea")) return;
+  panel.classList.toggle("is-hidden", !jobs.length && !agents.length);
+  root.replaceChildren();
+  jobs.forEach((job) => {
+    const row = resourceRow(`${job.kind} · ${job.status}`, job.error || job.job_id);
+    const output = document.createElement("details");
+    const title = document.createElement("summary");
+    title.textContent = "输出";
+    const content = document.createElement("pre");
+    content.textContent = (job.output || []).map((item) => typeof item.value === "string"
+      ? item.value : JSON.stringify(item.value, null, 2)).join("\n");
+    if (job.result) content.textContent += `\n${typeof job.result === "string" ? job.result : JSON.stringify(job.result, null, 2)}`;
+    output.append(title, content);
+    row.append(output);
+    const actions = ["running", "pending"].includes(job.status) ? ["pause", "cancel"]
+      : ["paused", "interrupted"].includes(job.status) ? ["resume", "cancel"] : [];
+    actions.forEach((action) => row.append(resourceButton(
+      { pause: "暂停", resume: "恢复", cancel: "取消" }[action], async () => {
+        await api(`/api/runs/${run.run_id}/jobs/${job.job_id}`, {
+          method: "POST", body: JSON.stringify({ action }),
+        });
+        await loadRun(run.run_id, { quiet: true });
+      },
+    )));
+    root.append(row);
+  });
+  agents.forEach((agent) => {
+    const row = resourceRow(`${agent.role} · ${agent.status}`, agent.result || agent.agent_id);
+    const form = document.createElement("form");
+    form.className = "resource-ingest";
+    const input = document.createElement("input");
+    input.placeholder = "补充子 Agent 的下一轮任务";
+    input.setAttribute("aria-label", `发送消息给 ${agent.role} 子 Agent`);
+    const button = document.createElement("button");
+    button.type = "submit";
+    button.className = "text-button";
+    button.textContent = "发送";
+    form.append(input, button);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!input.value.trim()) return;
+      button.disabled = true;
+      try {
+        const response = await api(`/api/runs/${run.run_id}/agents/${agent.agent_id}/message`, {
+          method: "POST", body: JSON.stringify({ message: input.value.trim() }),
+        });
+        input.value = "";
+        showToast(response.requires_parent_resume ? "已排队，请恢复父任务以启动子 Agent" : "已加入子 Agent 的下一轮队列");
+        await loadRun(run.run_id, { quiet: true });
+      } catch (error) { showToast(error.message, true); }
+      finally { button.disabled = false; }
+    });
+    row.append(form);
+    root.append(row);
+  });
+  const artifacts = run.artifact_manifest || [];
+  const artifactRoot = byId("artifactContent");
+  artifactRoot.replaceChildren();
+  byId("artifactPanel").classList.toggle("is-hidden", !run.task_session && !artifacts.length);
+  if (run.task_session) {
+    const replay = document.createElement("a");
+    replay.textContent = `查看轨迹 · ${run.task_session.event_count} 个事件`;
+    replay.href = `/api/runs/${run.run_id}/session`;
+    replay.target = "_blank";
+    replay.rel = "noopener";
+    artifactRoot.append(replay);
+  }
+  artifacts.forEach((item) => artifactRoot.append(resourceRow(
+    `${item.kind} · ${item.path}`, `${item.size} bytes · ${item.content_hash.slice(0, 12)}`,
+  )));
+}
+
 async function loadRuntimeResources(runId) {
   const root = byId("resourcesContent");
   root.textContent = "正在加载…";
   try {
-    const [memory, skills, rag, mcp] = await Promise.all([
+    const [memory, skills, rag, mcp, schedules, plugins, metrics] = await Promise.all([
       api(`/api/runs/${encodeURIComponent(runId)}/memory`),
       api(`/api/runs/${encodeURIComponent(runId)}/skills`),
       api(`/api/runs/${encodeURIComponent(runId)}/rag`),
       api("/api/mcp"),
+      api("/api/schedules"),
+      api("/api/plugins"),
+      api(`/api/runs/${encodeURIComponent(runId)}/metrics`),
     ]);
     if (state.currentRunId !== runId) return;
     root.replaceChildren();
@@ -636,6 +778,53 @@ async function loadRuntimeResources(runId) {
     const servers = Object.entries(mcp.servers || {});
     root.append(resourceHeading(`MCP (${servers.length})`));
     servers.forEach(([name, item]) => root.append(resourceRow(name, `${item.transport} · ${item.disabled ? "disabled" : "enabled"}`)));
+
+    root.append(resourceHeading("运行指标"));
+    root.append(resourceRow(`工具 ${metrics.tool_calls} 次 · 失败 ${metrics.tool_failures} 次`,
+      `${metrics.tool_seconds}s · 压缩 ${metrics.compactions} 次 · 证据 ${metrics.evidence_count} 条 · Job ${metrics.jobs} 个`));
+    const owned = schedules.filter((item) => item.source_run_id === runId);
+    root.append(resourceHeading(`定时任务 (${owned.length})`));
+    const scheduleForm = document.createElement("div");
+    scheduleForm.className = "resource-ingest";
+    const task = document.createElement("input");
+    task.placeholder = "未来要执行的任务";
+    const when = document.createElement("input");
+    when.type = "datetime-local";
+    when.setAttribute("aria-label", "执行时间");
+    scheduleForm.append(task, when, resourceButton("创建", async () => {
+      if (!task.value.trim() || !when.value) return;
+      await api("/api/schedules", { method: "POST", body: JSON.stringify({
+        task: task.value.trim(), source_run_id: runId, next_at: new Date(when.value).getTime() / 1000,
+      }) });
+      await loadRuntimeResources(runId);
+    }));
+    root.append(scheduleForm);
+    owned.forEach((item) => {
+      const row = resourceRow(`${item.status} · ${item.task}`, new Date(item.next_at * 1000).toLocaleString());
+      if (item.status === "active" || item.status === "paused") {
+        const action = item.status === "active" ? "pause" : "resume";
+        row.append(resourceButton(action === "pause" ? "暂停" : "恢复", async () => {
+          await api(`/api/schedules/${item.schedule_id}`, { method: "POST", body: JSON.stringify({ action }) });
+          await loadRuntimeResources(runId);
+        }));
+      }
+      if (item.status !== "deleted") row.append(resourceButton("移除", async () => {
+        await api(`/api/schedules/${item.schedule_id}`, { method: "POST", body: JSON.stringify({ action: "delete" }) });
+        await loadRuntimeResources(runId);
+      }));
+      root.append(row);
+    });
+    root.append(resourceHeading(`插件 (${plugins.length})`));
+    plugins.forEach((item) => {
+      const row = resourceRow(`${item.name || item.path} · ${item.version || ""}`,
+        item.error || `${item.trusted ? "已锁定信任" : "未信任"} · ${item.digest?.slice(0, 12) || ""}`);
+      if (!item.trusted && !item.error) row.append(resourceButton("信任此版本", async () => {
+        if (!window.confirm(`允许插件 ${item.name} 提供 Skills、MCP 和固定流程？信任将绑定当前内容哈希。`)) return;
+        await api("/api/plugins/trust", { method: "POST", body: JSON.stringify({ path: item.path, digest: item.digest }) });
+        await loadRuntimeResources(runId);
+      }));
+      root.append(row);
+    });
   } catch (error) {
     root.textContent = `资源加载失败：${error.message}`;
   }
@@ -1015,6 +1204,9 @@ function toolActivity(tool) {
   if (name.includes("patch") || name.includes("write") || name.includes("edit")) {
     return { kind: "编辑", label: "修改了文件" };
   }
+  if (name.includes("agent") || name.startsWith("job_")) {
+    return { kind: "代理", label: "调用了代理与后台任务工具" };
+  }
   if (name.includes("read") || name.includes("file") || name.includes("list") || name.includes("search_text")) {
     return { kind: "文件", label: "读取了工作区文件" };
   }
@@ -1195,6 +1387,23 @@ function renderMessageQueue(run) {
       : `等待执行 · ${formatTime(item.created_at, true)}`;
     content.append(message, meta);
     row.append(position, content);
+    if (item.status === "pending") {
+      row.append(resourceButton("移除", async () => {
+        await api(`/api/runs/${run.run_id}/queue/${item.id}`, { method: "DELETE" });
+        await loadRun(run.run_id, { quiet: true });
+      }));
+      if (index > 0 && items[index - 1].status === "pending") {
+        row.append(resourceButton("上移", async () => {
+          const pending = items.filter((value) => value.status === "pending").map((value) => value.id);
+          const at = pending.indexOf(item.id);
+          [pending[at - 1], pending[at]] = [pending[at], pending[at - 1]];
+          await api(`/api/runs/${run.run_id}/queue/order`, {
+            method: "POST", body: JSON.stringify({ item_ids: pending }),
+          });
+          await loadRun(run.run_id, { quiet: true });
+        }));
+      }
+    }
     if (item.status === "pending" && isBusy(run)) {
       const guide = document.createElement("button");
       guide.type = "button";

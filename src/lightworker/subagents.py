@@ -336,9 +336,10 @@ class SubagentManager:
         return value if isinstance(value, dict) else {"agents": []}
 
     def _add_node(self, agent_id: str, role: str, task: str) -> int:
-        with self._lock:
+        with self._lock, self.store.transaction(self.run_id):
             tree = self._tree()
-            if len(tree.get("agents") or []) >= self.max_total_agents:
+            durable = self.store.session(self.run_id).state("agents.json") or {}
+            if len(tree.get("agents") or []) + len(durable.get("agents", {})) >= self.max_total_agents:
                 raise RuntimeError(f"global subagent limit reached: {self.max_total_agents}")
             index = len(tree.get("agents") or [])
             tree.setdefault("agents", []).append(
@@ -357,7 +358,7 @@ class SubagentManager:
             return index
 
     def _finish_node(self, agent_id: str, result: dict[str, Any]) -> None:
-        with self._lock:
+        with self._lock, self.store.transaction(self.run_id):
             tree = self._tree()
             node = next((item for item in tree.get("agents") or [] if item.get("agent_id") == agent_id), None)
             if node is not None:

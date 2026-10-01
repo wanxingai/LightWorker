@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lightworker"
-version = "0.4.0"
+version = "0.5.0"
 description = "Auditable universal agent worker powered by LightAgent"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "LightWorker contributors" }]
 dependencies = [
-  "LightAgent>=0.10,<0.16",
+  "LightAgent>=0.11,<0.16",
   "pydantic>=2.8,<3",
   "pydantic-settings>=2.8,<3",
   "PyYAML>=6.0,<7",
@@ -26,6 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+signing = [
+  "cryptography>=44,<51",
+]
 drissionpage = [
   "DrissionPage>=4.1.1.4,<5",
 ]

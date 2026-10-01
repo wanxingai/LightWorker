@@ -28,7 +28,7 @@ class ControlStore:
         }
 
     def set_state(self, state: Literal["running", "paused", "cancelled"], reason: str = "") -> dict[str, Any]:
-        with self._lock:
+        with self.store.transaction(self.run_id):
             value = self.state()
             value.update(
                 {
@@ -41,7 +41,7 @@ class ControlStore:
             return value
 
     def add_steering(self, message: str) -> dict[str, Any]:
-        with self._lock:
+        with self.store.transaction(self.run_id):
             value = self.state()
             value["steering"].append(
                 {
@@ -55,7 +55,7 @@ class ControlStore:
             return value["steering"][-1]
 
     def consume_steering(self) -> list[str]:
-        with self._lock:
+        with self.store.transaction(self.run_id):
             value = self.state()
             messages = [
                 str(item.get("message") or "") for item in value["steering"] if not item.get("consumed")
